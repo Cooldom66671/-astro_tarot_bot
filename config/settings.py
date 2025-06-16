@@ -6,15 +6,10 @@
 - Централизованное хранение всех настроек приложения
 - Type-safe конфигурацию через Pydantic
 - Автоматическую проверку обязательных параметров при старте
-
-Использование:
-    from config.settings import settings
-
-    bot_token = settings.bot.token
-    db_url = settings.database.url
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Literal, Optional
 from functools import lru_cache
@@ -37,8 +32,9 @@ logger = logging.getLogger(__name__)
 class BotSettings(BaseSettings):
     """Настройки Telegram бота."""
 
+    # Делаем token опциональным с fallback на BOT_TOKEN
     token: SecretStr = Field(
-        ...,
+        default_factory=lambda: SecretStr(os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("BOT_TOKEN", ""))),
         description="Токен Telegram бота от @BotFather"
     )
     name: str = Field(
@@ -54,16 +50,52 @@ class BotSettings(BaseSettings):
         description="Использовать webhook вместо polling"
     )
 
-    model_config = SettingsConfigDict(
-        env_prefix="TELEGRAM_BOT_"
+    # ДОБАВЛЕНО: ID администраторов бота
+    admin_ids: list[int] = Field(
+        default_factory=lambda: [
+            int(x.strip())
+            for x in os.getenv("BOT_ADMIN_IDS", "").split(",")
+            if x.strip() and x.strip().isdigit()
+        ],
+        description="ID администраторов бота"
     )
+
+    # ДОБАВЛЕНО: Версия бота
+    version: str = Field(
+        default="1.0.0",
+        description="Версия бота"
+    )
+
+    # ДОБАВЛЕНО: Токен провайдера платежей для Telegram Payments
+    provider_token: Optional[SecretStr] = Field(
+        default_factory=lambda: SecretStr(os.getenv("TELEGRAM_PAYMENT_TOKEN", "")),
+        description="Токен платежного провайдера Telegram"
+    )
+
+    model_config = SettingsConfigDict(
+        env_prefix="TELEGRAM_BOT_",
+        protected_namespaces=('settings_',),  # Исправляем warning с model_
+        extra="ignore"  # Игнорируем лишние поля
+    )
+
+    @field_validator('token')
+    @classmethod
+    def validate_token(cls, v: SecretStr) -> SecretStr:
+        """Проверяем, что токен не пустой."""
+        if not v or not v.get_secret_value():
+            # Пробуем альтернативные имена переменных
+            alt_token = os.getenv("BOT_TOKEN") or os.getenv("TG_BOT_TOKEN") or ""
+            if alt_token:
+                return SecretStr(alt_token)
+            raise ValueError('Токен бота не найден в переменных окружения')
+        return v
 
 
 class DatabaseSettings(BaseSettings):
     """Настройки базы данных PostgreSQL."""
 
     url: str = Field(
-        ...,
+        default_factory=lambda: os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/astrotarot_db"),
         description="URL подключения к PostgreSQL"
     )
     echo: bool = Field(
@@ -83,12 +115,19 @@ class DatabaseSettings(BaseSettings):
     @classmethod
     def validate_postgres_url(cls, v: str) -> str:
         """Проверяем, что URL для PostgreSQL."""
-        if not v.startswith(('postgresql://', 'postgresql+asyncpg://')):
+        if not v:
+            return "postgresql://postgres:postgres@localhost:5432/astrotarot_db"
+        # Поддерживаем оба варианта - синхронный и асинхронный драйвер
+        if not v.startswith(('postgresql://', 'postgresql+asyncpg://', 'postgres://')):
             raise ValueError('База данных должна быть PostgreSQL')
+        # Заменяем postgres:// на postgresql:// для совместимости
+        if v.startswith('postgres://'):
+            v = v.replace('postgres://', 'postgresql://', 1)
         return v
 
     model_config = SettingsConfigDict(
-        env_prefix="DATABASE_"
+        env_prefix="DATABASE_",
+        extra="ignore"  # Игнорируем лишние поля
     )
 
 
@@ -96,123 +135,145 @@ class RedisSettings(BaseSettings):
     """Настройки Redis для кэширования и FSM."""
 
     url: str = Field(
-        default="redis://localhost:6379/0",
+        default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         description="URL подключения к Redis"
     )
-    ttl: int = Field(
-        default=3600,
-        description="Время жизни кэша в секундах (по умолчанию 1 час)"
+    decode_responses: bool = Field(
+        default=True,
+        description="Декодировать ответы в строки"
     )
+
+    # ДОБАВЛЕНО: TTL для FSM состояний
     fsm_ttl: int = Field(
-        default=86400,
-        description="Время жизни состояний FSM (по умолчанию 24 часа)"
+        default=86400,  # 24 часа
+        description="Время жизни FSM состояний в секундах"
+    )
+
+    # ДОБАВЛЕНО: TTL для кэша
+    cache_ttl: int = Field(
+        default=3600,  # 1 час
+        description="Время жизни кэша в секундах"
     )
 
     model_config = SettingsConfigDict(
-        env_prefix="REDIS_"
+        env_prefix="REDIS_",
+        extra="ignore"  # Игнорируем лишние поля
     )
 
 
 class LLMSettings(BaseSettings):
-    """Настройки для работы с языковыми моделями."""
+    """Настройки для языковых моделей."""
 
+    # OpenAI
     openai_api_key: Optional[SecretStr] = Field(
         default=None,
         description="API ключ OpenAI"
     )
+    openai_model: str = Field(
+        default="gpt-4-turbo-preview",
+        description="Модель OpenAI для использования"
+    )
+
+    # Anthropic
     anthropic_api_key: Optional[SecretStr] = Field(
         default=None,
-        description="API ключ Anthropic Claude"
+        description="API ключ Anthropic"
     )
-    default_provider: Literal["openai", "anthropic"] = Field(
-        default="openai",
-        description="Провайдер по умолчанию"
+    anthropic_model: str = Field(
+        default="claude-3-opus-20240229",
+        description="Модель Anthropic для использования"
     )
-    model_name: str = Field(
-        default="gpt-4o-mini",
-        description="Модель по умолчанию"
+
+    # Общие настройки
+    temperature: float = Field(
+        default=0.7,
+        description="Температура генерации"
     )
     max_tokens: int = Field(
         default=2000,
-        description="Максимальное количество токенов в ответе"
-    )
-    temperature: float = Field(
-        default=0.7,
-        description="Температура генерации (0.0 - 1.0)"
-    )
-    cache_responses: bool = Field(
-        default=True,
-        description="Кэшировать ответы LLM"
+        description="Максимальное количество токенов"
     )
 
-    @field_validator('temperature')
-    @classmethod
-    def validate_temperature(cls, v: float) -> float:
-        """Проверяем диапазон температуры."""
-        if not 0.0 <= v <= 1.0:
-            raise ValueError('Температура должна быть от 0.0 до 1.0')
-        return v
+    # ДОБАВЛЕНО: Таймаут для запросов
+    request_timeout: int = Field(
+        default=30,
+        description="Таймаут запросов к LLM в секундах"
+    )
 
     model_config = SettingsConfigDict(
-        env_prefix="LLM_"
+        env_prefix="LLM_",
+        protected_namespaces=('settings_',),
+        extra="ignore"  # Игнорируем лишние поля
     )
 
 
 class PaymentSettings(BaseSettings):
-    """Настройки платежной системы YooKassa."""
+    """Настройки платежных систем."""
 
-    shop_id: Optional[str] = Field(
+    # YooKassa
+    yookassa_shop_id: Optional[str] = Field(
         default=None,
-        description="ID магазина в YooKassa"
+        description="ID магазина в ЮKassa"
     )
-    secret_key: Optional[SecretStr] = Field(
+    yookassa_secret_key: Optional[SecretStr] = Field(
         default=None,
-        description="Секретный ключ YooKassa"
+        description="Секретный ключ ЮKassa"
     )
-    return_url: Optional[str] = Field(
+
+    # Telegram Payments - УДАЛЕНО (перенесено в BotSettings)
+
+    # CryptoBot
+    cryptobot_token: Optional[SecretStr] = Field(
         default=None,
-        description="URL для возврата после оплаты"
+        description="Токен CryptoBot"
     )
-    webhook_url: Optional[str] = Field(
-        default=None,
-        description="URL для вебхуков от YooKassa"
-    )
+
+    # Общие настройки
     test_mode: bool = Field(
         default=True,
         description="Тестовый режим платежей"
     )
 
-    model_config = SettingsConfigDict(
-        env_prefix="YOOKASSA_"
+    # ДОБАВЛЕНО: URL для webhook платежей
+    webhook_url: Optional[str] = Field(
+        default=None,
+        description="URL для webhook уведомлений о платежах"
     )
+
+    model_config = SettingsConfigDict(
+        env_prefix="PAYMENT_",
+        extra="ignore"  # Игнорируем лишние поля
+    )
+
+    @property
+    def provider_token(self) -> Optional[SecretStr]:
+        """Обратная совместимость для provider_token."""
+        # Возвращаем токен из BotSettings для обратной совместимости
+        from config import settings
+        return settings.bot.provider_token
 
 
 class SecuritySettings(BaseSettings):
     """Настройки безопасности."""
 
     secret_key: SecretStr = Field(
-        ...,
-        description="Секретный ключ для JWT и прочего"
+        default_factory=lambda: SecretStr(os.getenv("SECRET_KEY", os.urandom(32).hex())),
+        description="Секретный ключ приложения"
     )
+
     encryption_key: SecretStr = Field(
-        ...,
-        description="Ключ для шифрования персональных данных"
+        default_factory=lambda: SecretStr(os.getenv("ENCRYPTION_KEY", os.urandom(32).hex())),
+        description="Ключ шифрования данных"
     )
-    jwt_algorithm: str = Field(
-        default="HS256",
-        description="Алгоритм JWT"
-    )
-    jwt_expire_minutes: int = Field(
-        default=30,
-        description="Время жизни JWT токена в минутах"
-    )
-    rate_limit_per_minute: int = Field(
-        default=20,
-        description="Лимит запросов на пользователя в минуту"
+
+    allowed_hosts: list[str] = Field(
+        default=["*"],
+        description="Разрешенные хосты"
     )
 
     model_config = SettingsConfigDict(
-        env_prefix="SECURITY_"
+        env_prefix="SECURITY_",
+        extra="ignore"  # Игнорируем лишние поля
     )
 
 
@@ -220,33 +281,33 @@ class CelerySettings(BaseSettings):
     """Настройки Celery для фоновых задач."""
 
     broker_url: str = Field(
-        default="redis://localhost:6379/0",
+        default_factory=lambda: os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/1"),
         description="URL брокера сообщений"
     )
+
     result_backend: str = Field(
-        default="redis://localhost:6379/1",
+        default_factory=lambda: os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/2"),
         description="URL для хранения результатов"
     )
+
     task_serializer: str = Field(
         default="json",
-        description="Формат сериализации задач"
+        description="Сериализатор задач"
     )
+
     result_serializer: str = Field(
         default="json",
-        description="Формат сериализации результатов"
-    )
-    timezone: str = Field(
-        default="UTC",
-        description="Часовой пояс для планировщика"
+        description="Сериализатор результатов"
     )
 
     model_config = SettingsConfigDict(
-        env_prefix="CELERY_"
+        env_prefix="CELERY_",
+        extra="ignore"  # Игнорируем лишние поля
     )
 
 
 class APISettings(BaseSettings):
-    """Настройки REST API для админ-панели."""
+    """Настройки API сервера."""
 
     host: str = Field(
         default="0.0.0.0",
@@ -266,7 +327,8 @@ class APISettings(BaseSettings):
     )
 
     model_config = SettingsConfigDict(
-        env_prefix="API_"
+        env_prefix="API_",
+        extra="ignore"  # Игнорируем лишние поля
     )
 
 
@@ -313,13 +375,18 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         # Позволяет использовать как префиксы, так и без них
-        env_nested_delimiter="__"
+        env_nested_delimiter="__",
+        extra="ignore"  # ВАЖНО: Игнорируем все лишние поля из .env
     )
 
     def __init__(self, **kwargs):
         """Инициализация настроек с логированием."""
         super().__init__(**kwargs)
         logger.info(f"Настройки загружены для окружения: {self.environment}")
+
+        # ДОБАВЛЕНО: Логируем количество админов
+        if self.bot.admin_ids:
+            logger.info(f"Загружено {len(self.bot.admin_ids)} администраторов")
 
         # Проверяем критичные настройки для production
         if self.environment == "production":
@@ -338,6 +405,10 @@ class Settings(BaseSettings):
 
         if self.database.echo:
             logger.warning("SQL логирование включено в production!")
+
+        # ДОБАВЛЕНО: Проверка админов
+        if not self.bot.admin_ids:
+            logger.warning("Не указаны администраторы бота!")
 
 
 @lru_cache()

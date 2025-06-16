@@ -406,18 +406,26 @@ class StateUtils:
     @staticmethod
     def is_payment_state(state: State) -> bool:
         """Проверить, относится ли состояние к оплате."""
-        payment_states = []
-        for state_group in PAYMENT_STATES:
-            payment_states.extend(state_group.__all_states__)
-        return state in payment_states
+        # В aiogram 3.x проверяем принадлежность к группе через строковое представление
+        if state:
+            state_str = str(state)
+            return any(
+                state_group.__name__ in state_str
+                for state_group in PAYMENT_STATES
+            )
+        return False
 
     @staticmethod
     def is_admin_state(state: State) -> bool:
         """Проверить, относится ли состояние к админ функциям."""
-        admin_states = []
-        for state_group in ADMIN_STATES:
-            admin_states.extend(state_group.__all_states__)
-        return state in admin_states
+        # В aiogram 3.x проверяем принадлежность к группе через строковое представление
+        if state:
+            state_str = str(state)
+            return any(
+                state_group.__name__ in state_str
+                for state_group in ADMIN_STATES
+            )
+        return False
 
     @staticmethod
     def get_timeout(state: State) -> int:

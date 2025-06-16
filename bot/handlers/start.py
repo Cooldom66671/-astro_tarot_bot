@@ -14,23 +14,36 @@
 
 import logging
 import re
-from typing import Optional
+from typing import Optional, Any
 from datetime import datetime, timedelta
 
 from aiogram import Router, types, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from bot.handlers.base import BaseHandler, error_handler, log_action, get_or_create_user
+from bot.handlers.base import (
+    BaseHandler,
+    error_handler,
+    log_action,
+    get_or_create_user,
+    answer_callback_query,
+    edit_or_send_message
+)
 from infrastructure import get_unit_of_work
-from infrastructure.telegram import (
+from config import settings
+
+# НОВЫЕ ИМПОРТЫ ДЛЯ КЛАВИАТУР
+from infrastructure.telegram.keyboards import (
     Keyboards,
-    get_welcome_message,
-    get_onboarding_message,
-    WelcomeMessageType,
-    OnboardingStep,
-    get_time_based_greeting
+    get_main_menu,
+    get_welcome_keyboard,
+    TimeBasedGreetingKeyboard,
+    BirthDataKeyboard,
+    get_birth_data_keyboard,
+    MainMenuCallbackData,
+    BirthDataCallbackData,
+    parse_callback_data
 )
 
 # Настройка логирования
@@ -52,16 +65,17 @@ class StartHandler(BaseHandler):
 
     def register_handlers(self) -> None:
         """Регистрация обработчиков."""
-        # Команда /start
+        # Команда /start без параметров
         self.router.message.register(
             self.cmd_start,
             CommandStart()
         )
 
-        # Обработка реферальных параметров
+        # Команда /start с параметрами (deep link)
         self.router.message.register(
-            self.cmd_start_with_ref,
-            CommandStart(deep_link=True)
+            self.cmd_start_with_args,
+            Command("start"),
+            lambda message: len(message.text.split()) > 1
         )
 
         # Состояния онбординга
@@ -97,12 +111,19 @@ class StartHandler(BaseHandler):
             F.data.startswith("welcome:")
         )
 
+        # НОВЫЕ CALLBACK ДЛЯ ДАННЫХ РОЖДЕНИЯ
+        self.router.callback_query.register(
+            self.birth_data_callback,
+            BirthDataCallbackData.filter()
+        )
+
     @error_handler()
     @log_action("start_command")
     async def cmd_start(
             self,
             message: types.Message,
-            state: FSMContext
+            state: FSMContext,
+            **kwargs
     ) -> None:
         """
         Обработчик команды /start.
@@ -111,32 +132,42 @@ class StartHandler(BaseHandler):
             message: Сообщение пользователя
             state: Контекст FSM
         """
+        # Очищаем состояние
+        await state.clear()
+
         user_telegram = message.from_user
 
         # Получаем или создаем пользователя
-        async with get_unit_of_work() as uow:
-            user = await uow.users.get_by_telegram_id(user_telegram.id)
+        user = await get_or_create_user(user_telegram)
 
-            if user:
-                # Существующий пользователь
-                await self._handle_existing_user(message, user, state)
+        # Проверяем, новый ли это пользователь
+        async with get_unit_of_work() as uow:
+            # Проверяем, есть ли у пользователя заполненные данные
+            user_db = await uow.users.get_by_telegram_id(user_telegram.id)
+
+            if user_db and user_db.birth_date:
+                # Существующий пользователь с данными
+                await self._handle_existing_user(message, user_db, state)
             else:
-                # Новый пользователь
+                # Новый пользователь или без данных
                 await self._handle_new_user(message, state)
 
     @error_handler()
-    @log_action("start_with_referral")
-    async def cmd_start_with_ref(
+    @log_action("start_with_args")
+    async def cmd_start_with_args(
             self,
             message: types.Message,
-            state: FSMContext
+            state: FSMContext,
+            command: CommandObject = None,
+            **kwargs
     ) -> None:
         """
-        Обработчик /start с реферальным кодом.
+        Обработчик /start с параметрами.
 
         Args:
             message: Сообщение пользователя
             state: Контекст FSM
+            command: Объект команды
         """
         # Извлекаем параметр
         args = message.text.split(maxsplit=1)
@@ -148,6 +179,8 @@ class StartHandler(BaseHandler):
                 await self._handle_referral(message, param[4:], state)
             elif param.startswith("promo_"):
                 await self._handle_promo(message, param[6:], state)
+            elif param.startswith("reading_"):
+                await self._handle_shared_reading(message, param[8:], state)
             else:
                 # Обычный старт
                 await self.cmd_start(message, state)
@@ -161,60 +194,39 @@ class StartHandler(BaseHandler):
             state: FSMContext
     ) -> None:
         """Обработка существующего пользователя."""
-        # Очищаем состояние
-        await state.clear()
+        # Получаем приветственное сообщение на основе времени
+        greeting = self._get_time_based_greeting()
+        user_name = user.first_name or "друг"
 
-        # Считаем дни отсутствия
-        days_away = 0
-        if user.last_activity:
-            days_away = (datetime.now() - user.last_activity).days
-
-        # Обновляем последнюю активность
-        async with get_unit_of_work() as uow:
-            await uow.users.update(
-                user.id,
-                last_activity=datetime.now()
-            )
-
-        # Выбираем тип приветствия
-        if days_away > 30:
-            message_type = WelcomeMessageType.AFTER_BLOCK
-        else:
-            message_type = WelcomeMessageType.RETURNING_USER
-
-        # Формируем приветствие
-        welcome_text = await get_welcome_message(
-            message_type,
-            {
-                "first_name": user.first_name,
-                "days_away": days_away,
-                "last_action": user.last_action
-            }
+        text = (
+            f"{greeting}, {user_name}! 👋\n\n"
+            f"Рад видеть вас снова!\n"
+            f"Чем могу помочь сегодня?"
         )
 
-        # Отправляем с главным меню
-        keyboard = await Keyboards.main_menu(
-            user_subscription=user.subscription_plan or "free",
-            is_admin=user.is_admin,
-            user_name=user.first_name
+        # ИСПОЛЬЗУЕМ НОВУЮ ФУНКЦИЮ ДЛЯ ГЛАВНОГО МЕНЮ
+        keyboard = await get_main_menu(
+            user_subscription=user.subscription_plan if hasattr(user, 'subscription_plan') else 'free',
+            is_admin=user.telegram_id in settings.bot.admin_ids,
+            user_name=user_name
         )
+
+        await message.answer(text, reply_markup=keyboard)
+
+        # ОПЦИОНАЛЬНО: Показываем быстрые действия по времени суток
+        time_keyboard = TimeBasedGreetingKeyboard(user_name)
+        inline_kb = await time_keyboard.build()
 
         await message.answer(
-            welcome_text,
-            reply_markup=keyboard,
-            parse_mode="MarkdownV2"
+            "Вот что я рекомендую сейчас:",
+            reply_markup=inline_kb
         )
 
-        # Показываем быстрые действия
-        quick_keyboard = await Keyboards.quick_actions(
-            user_subscription=user.subscription_plan or "free"
-        )
-
-        greeting = get_time_based_greeting(user.first_name)
-        await message.answer(
-            f"{greeting}\nЧто будем делать сегодня?",
-            reply_markup=quick_keyboard,
-            parse_mode="MarkdownV2"
+        # Логируем возвращение
+        await self.log_action(
+            user.telegram_id,
+            "user_returned",
+            {"days_since_last_visit": self._calculate_days_since_last_visit(user)}
         )
 
     async def _handle_new_user(
@@ -223,38 +235,30 @@ class StartHandler(BaseHandler):
             state: FSMContext
     ) -> None:
         """Обработка нового пользователя."""
-        user_telegram = message.from_user
+        user_name = message.from_user.first_name or "друг"
 
-        # Создаем пользователя
-        async with get_unit_of_work() as uow:
-            user = await uow.users.create_or_update_from_telegram(
-                telegram_id=user_telegram.id,
-                username=user_telegram.username,
-                first_name=user_telegram.first_name,
-                last_name=user_telegram.last_name,
-                language_code=user_telegram.language_code
-            )
-
-        # Приветственное сообщение
-        welcome_text = await get_welcome_message(
-            WelcomeMessageType.FIRST_START,
-            {"first_name": user_telegram.first_name}
+        text = (
+            f"🌟 Добро пожаловать, {user_name}!\n\n"
+            f"Я - Астро-Таро Бот, ваш персональный помощник в мире "
+            f"астрологии и таро.\n\n"
+            f"Что я умею:\n"
+            f"🎴 Делать расклады Таро\n"
+            f"⭐ Строить натальные карты\n"
+            f"🌙 Рассчитывать совместимость\n"
+            f"📅 Давать персональные прогнозы\n\n"
+            f"Давайте начнем с короткого знакомства?"
         )
 
-        # Приветственная клавиатура
-        keyboard = await Keyboards.welcome(user_telegram.first_name)
+        # ИСПОЛЬЗУЕМ НОВУЮ WELCOME КЛАВИАТУРУ
+        keyboard = await get_welcome_keyboard(user_name)
 
-        await message.answer(
-            welcome_text,
-            reply_markup=keyboard,
-            parse_mode="MarkdownV2"
-        )
+        await message.answer(text, reply_markup=keyboard)
 
-        # Сохраняем данные в состояние
-        await state.update_data(
-            user_id=user.id,
-            is_new_user=True,
-            onboarding_step=OnboardingStep.WELCOME.value
+        # Логируем нового пользователя
+        await self.log_action(
+            message.from_user.id,
+            "new_user_start",
+            {"source": "direct"}
         )
 
     async def _handle_referral(
@@ -264,54 +268,31 @@ class StartHandler(BaseHandler):
             state: FSMContext
     ) -> None:
         """Обработка реферальной ссылки."""
-        user_telegram = message.from_user
+        # Сохраняем реферальный код
+        await state.update_data(referral_code=referral_code)
 
+        # Находим реферера
         async with get_unit_of_work() as uow:
-            # Проверяем реферальный код
             referrer = await uow.users.get_by_referral_code(referral_code)
 
-            if not referrer:
-                # Неверный код - обычная регистрация
-                await self.cmd_start(message, state)
-                return
+            if referrer:
+                # Сохраняем связь
+                user = await get_or_create_user(message.from_user)
+                user.referred_by = referrer.id
+                await uow.users.update(user)
+                await uow.commit()
 
-            # Создаем пользователя с реферером
-            user = await uow.users.create_or_update_from_telegram(
-                telegram_id=user_telegram.id,
-                username=user_telegram.username,
-                first_name=user_telegram.first_name,
-                last_name=user_telegram.last_name,
-                language_code=user_telegram.language_code,
-                referred_by_id=referrer.id
-            )
+                # Уведомляем реферера
+                try:
+                    await message.bot.send_message(
+                        referrer.telegram_id,
+                        f"🎉 По вашей реферальной ссылке зарегистрировался новый пользователь!"
+                    )
+                except Exception as e:
+                    logger.error(f"Не удалось уведомить реферера: {e}")
 
-            # Начисляем бонусы (если есть)
-            # TODO: Добавить начисление бонусов
-
-        # Специальное приветствие
-        welcome_text = await get_welcome_message(
-            WelcomeMessageType.REFERRAL,
-            {
-                "first_name": user_telegram.first_name,
-                "referrer_name": referrer.first_name
-            }
-        )
-
-        keyboard = await Keyboards.welcome(user_telegram.first_name)
-
-        await message.answer(
-            welcome_text,
-            reply_markup=keyboard,
-            parse_mode="MarkdownV2"
-        )
-
-        # Сохраняем данные
-        await state.update_data(
-            user_id=user.id,
-            is_new_user=True,
-            referrer_id=referrer.id,
-            onboarding_step=OnboardingStep.WELCOME.value
-        )
+        # Продолжаем обычный старт
+        await self.cmd_start(message, state)
 
     async def _handle_promo(
             self,
@@ -319,286 +300,535 @@ class StartHandler(BaseHandler):
             promo_code: str,
             state: FSMContext
     ) -> None:
-        """Обработка промокода при старте."""
-        # Создаем пользователя как обычно
-        await self._handle_new_user(message, state)
-
-        # Сохраняем промокод для применения позже
+        """Обработка промокода."""
+        # Сохраняем промокод
         await state.update_data(promo_code=promo_code)
 
-    @error_handler()
+        # Проверяем промокод
+        async with get_unit_of_work() as uow:
+            promo = await uow.promo_codes.get_by_code(promo_code)
+
+            if promo and promo.is_active:
+                text = f"🎁 Промокод {promo_code} активирован! {promo.description}"
+                await message.answer(text)
+
+        # Продолжаем обычный старт
+        await self.cmd_start(message, state)
+
+    async def _handle_shared_reading(
+            self,
+            message: types.Message,
+            reading_id: str,
+            state: FSMContext
+    ) -> None:
+        """Обработка просмотра shared расклада."""
+        # TODO: Реализовать просмотр расклада
+        await message.answer("Просмотр расклада будет доступен после регистрации!")
+        await self.cmd_start(message, state)
+
+    # Обработчики callback кнопок
+
     async def welcome_callback(
             self,
             callback: types.CallbackQuery,
             state: FSMContext
     ) -> None:
-        """Обработка callback кнопок приветствия."""
-        action = callback.data.split(":")[1]
+        """Обработчик callback кнопок приветствия."""
+        action = callback.data.split(":")[-1]
 
         if action == "start":
-            # Начинаем онбординг
-            await self._start_onboarding(callback.message, state)
-
+            await self._start_onboarding(callback, state)
         elif action == "quick_start":
-            # Быстрый старт - сразу главное меню
-            await self._quick_start(callback.message, state)
-
+            await self._quick_start(callback, state)
         elif action == "about":
-            # Информация о боте
-            from infrastructure.telegram import get_info_message
-            info_text = await get_info_message("about")
-
-            await callback.message.answer(
-                info_text,
-                parse_mode="MarkdownV2"
-            )
-
+            await self._show_about(callback, state)
         elif action == "promo":
-            # Ввод промокода
-            await callback.message.answer(
-                "🎁 Введите промокод:",
-                parse_mode="MarkdownV2"
-            )
-            # TODO: Добавить состояние для ввода промокода
+            await self._enter_promo(callback, state)
 
-        await callback.answer()
+        await answer_callback_query(callback)
 
-    async def _start_onboarding(
+    # НОВЫЙ ОБРАБОТЧИК ДЛЯ ДАННЫХ РОЖДЕНИЯ
+    async def birth_data_callback(
             self,
-            message: types.Message,
+            callback: types.CallbackQuery,
+            callback_data: BirthDataCallbackData,
             state: FSMContext
     ) -> None:
-        """Начать процесс онбординга."""
-        # Первый шаг - знакомство
-        onboarding_text = await get_onboarding_message(
-            OnboardingStep.INTRODUCTION
-        )
+        """Обработчик callback для данных рождения."""
+        action = callback_data.action
 
-        await message.answer(
-            onboarding_text,
-            parse_mode="MarkdownV2"
-        )
+        if action == "edit":
+            # Редактирование поля
+            field = callback_data.field
+            current_data = await state.get_data()
 
-        # Просим представиться
-        await message.answer(
-            "Как мне к тебе обращаться? Напиши своё имя:",
-            parse_mode="MarkdownV2"
-        )
-
-        await state.set_state(OnboardingStates.waiting_name)
-        await state.update_data(
-            onboarding_step=OnboardingStep.INTRODUCTION.value
-        )
-
-    async def _quick_start(
-            self,
-            message: types.Message,
-            state: FSMContext
-    ) -> None:
-        """Быстрый старт без онбординга."""
-        data = await state.get_data()
-        user_id = data.get("user_id")
-
-        if not user_id:
-            return
-
-        # Обновляем пользователя
-        async with get_unit_of_work() as uow:
-            user = await uow.users.get_by_id(user_id)
-            if user:
-                await uow.users.update(
-                    user_id,
-                    onboarding_completed=True
-                )
-
-        # Показываем главное меню
-        keyboard = await Keyboards.main_menu()
-
-        await message.answer(
-            "Отлично! Вот главное меню:",
-            reply_markup=keyboard,
-            parse_mode="MarkdownV2"
-        )
-
-        # Показываем подсказку по командам
-        from infrastructure.telegram import get_info_message
-        commands_text = await get_info_message("commands")
-
-        await message.answer(
-            commands_text,
-            parse_mode="MarkdownV2"
-        )
-
-        # Очищаем состояние
-        await state.clear()
-
-    @error_handler()
-    async def process_name(
-            self,
-            message: types.Message,
-            state: FSMContext
-    ) -> None:
-        """Обработка ввода имени."""
-        name = message.text.strip()
-
-        # Валидация имени
-        if len(name) < 2 or len(name) > 50:
-            await message.answer(
-                "❌ Имя должно быть от 2 до 50 символов",
-                parse_mode="MarkdownV2"
-            )
-            return
-
-        # Сохраняем имя
-        data = await state.get_data()
-        user_id = data.get("user_id")
-
-        async with get_unit_of_work() as uow:
-            await uow.users.update(
-                user_id,
-                preferred_name=name
+            keyboard = await get_birth_data_keyboard(
+                current_data=current_data,
+                editing_field=field
             )
 
-        await state.update_data(user_name=name)
+            await callback.message.edit_reply_markup(reply_markup=keyboard)
 
-        # Следующий шаг - данные рождения
-        onboarding_text = await get_onboarding_message(
-            OnboardingStep.BIRTH_DATA,
-            {"user_name": name}
-        )
+        elif action == "set_date":
+            # Установка даты
+            date_str = callback_data.value
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+            await state.update_data(birth_date=date_obj)
 
-        # Клавиатура для ввода данных
-        from infrastructure.telegram import get_birth_data_keyboard
-        keyboard = await get_birth_data_keyboard()
+            # Возвращаемся к общему виду
+            current_data = await state.get_data()
+            keyboard = await get_birth_data_keyboard(current_data=current_data)
 
-        await message.answer(
-            onboarding_text,
-            reply_markup=keyboard,
-            parse_mode="MarkdownV2"
-        )
+            await callback.message.edit_reply_markup(reply_markup=keyboard)
 
-        await state.update_data(
-            onboarding_step=OnboardingStep.BIRTH_DATA.value
-        )
+        elif action == "set_time":
+            # Установка времени
+            time_str = callback_data.value
+            time_obj = datetime.strptime(time_str, "%H:%M").time()
+            await state.update_data(birth_time=time_obj)
 
-    @error_handler()
+            # Возвращаемся к общему виду
+            current_data = await state.get_data()
+            keyboard = await get_birth_data_keyboard(current_data=current_data)
+
+            await callback.message.edit_reply_markup(reply_markup=keyboard)
+
+        elif action == "set_place":
+            # Установка места
+            place_data = callback_data.value.split("|")
+            await state.update_data(
+                birth_place={
+                    "name": place_data[0],
+                    "lat": float(place_data[1]),
+                    "lon": float(place_data[2])
+                }
+            )
+
+            # Возвращаемся к общему виду
+            current_data = await state.get_data()
+            keyboard = await get_birth_data_keyboard(current_data=current_data)
+
+            await callback.message.edit_reply_markup(reply_markup=keyboard)
+
+        elif action == "confirm":
+            # Сохранение данных
+            await self._save_birth_data(callback.message, state)
+
+        await answer_callback_query(callback)
+
     async def onboarding_callback(
             self,
             callback: types.CallbackQuery,
             state: FSMContext
     ) -> None:
-        """Обработка callback кнопок онбординга."""
-        action = callback.data.split(":")[1]
+        """Обработчик callback кнопок онбординга."""
+        action = callback.data.split(":")[-1]
 
-        if action == "skip":
-            # Пропуск текущего шага
-            await self._skip_onboarding_step(callback.message, state)
+        if action == "start":
+            await self._start_onboarding(callback, state)
+        elif action == "skip":
+            await self._skip_onboarding(callback, state)
+        elif action == "back":
+            await self._onboarding_back(callback, state)
+        elif action.startswith("interest_"):
+            await self._handle_interest_selection(callback, action[9:], state)
 
-        elif action == "complete":
-            # Завершение онбординга
-            await self._complete_onboarding(callback.message, state)
+        await answer_callback_query(callback)
 
-        await callback.answer()
+    # Методы онбординга
 
-    async def _skip_onboarding_step(
+    async def _start_onboarding(
             self,
-            message: types.Message,
+            callback: types.CallbackQuery,
             state: FSMContext
     ) -> None:
-        """Пропустить текущий шаг онбординга."""
-        data = await state.get_data()
-        current_step = data.get("onboarding_step")
-
-        # Определяем следующий шаг
-        steps = list(OnboardingStep)
-        current_index = next(
-            (i for i, s in enumerate(steps) if s.value == current_step),
-            0
+        """Начало процесса онбординга."""
+        text = (
+            "Отлично! Для персональных прогнозов мне понадобятся "
+            "ваши данные рождения.\n\n"
+            "Это займет всего пару минут."
         )
 
-        if current_index < len(steps) - 1:
-            next_step = steps[current_index + 1]
+        # ИСПОЛЬЗУЕМ НОВУЮ КЛАВИАТУРУ ДЛЯ ДАННЫХ РОЖДЕНИЯ
+        keyboard = await get_birth_data_keyboard()
 
-            # Показываем следующий шаг
-            onboarding_text = await get_onboarding_message(next_step)
+        await edit_or_send_message(
+            callback.message,
+            text,
+            reply_markup=keyboard
+        )
 
-            await message.answer(
-                onboarding_text,
-                parse_mode="MarkdownV2"
-            )
+        # Устанавливаем состояние
+        await state.set_state(OnboardingStates.waiting_birth_date)
 
-            await state.update_data(
-                onboarding_step=next_step.value
-            )
-        else:
-            # Завершаем онбординг
-            await self._complete_onboarding(message, state)
-
-    async def _complete_onboarding(
+    async def _quick_start(
             self,
-            message: types.Message,
+            callback: types.CallbackQuery,
             state: FSMContext
     ) -> None:
-        """Завершить процесс онбординга."""
-        data = await state.get_data()
-        user_id = data.get("user_id")
+        """Быстрый старт без заполнения данных."""
+        # Очищаем состояние
+        await state.clear()
 
-        # Обновляем пользователя
-        async with get_unit_of_work() as uow:
-            await uow.users.update(
-                user_id,
-                onboarding_completed=True
-            )
+        # Показываем главное меню
+        keyboard = await get_main_menu(user_subscription="free")
 
-        # Поздравление
-        complete_text = await get_onboarding_message(
-            OnboardingStep.COMPLETE
+        await callback.message.answer(
+            "⚡ Отлично! Вы можете начать использовать бот прямо сейчас.\n"
+            "Данные для персональных прогнозов можно добавить позже в профиле.",
+            reply_markup=keyboard
         )
 
-        await message.answer(
-            complete_text,
-            parse_mode="MarkdownV2"
+        await callback.message.delete()
+
+    async def _show_about(
+            self,
+            callback: types.CallbackQuery,
+            state: FSMContext
+    ) -> None:
+        """Показать информацию о боте."""
+        about_text = (
+            "🔮 <b>Астро-Таро Бот</b>\n\n"
+            "Версия 1.0.0\n\n"
+            "<b>Возможности:</b>\n"
+            "🎴 Расклады Таро - от простых до сложных\n"
+            "⭐ Персональные гороскопы\n"
+            "🗺 Натальная карта с подробным анализом\n"
+            "🌙 Лунный календарь\n"
+            "💑 Синастрия - совместимость пар\n"
+            "📚 Обучающие материалы\n\n"
+            "<b>Тарифы:</b>\n"
+            "• Бесплатный - базовые функции\n"
+            "• Базовый - расширенные возможности\n"
+            "• Премиум - полный доступ\n"
+            "• VIP - персональный астролог\n\n"
+            "💬 Поддержка: @astrotarot_support\n"
+            "📢 Новости: @astrotarot_news"
+        )
+
+        # Кнопка назад
+        keyboard = await Keyboards.back("welcome:menu")
+
+        await callback.message.edit_text(
+            about_text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+    async def _enter_promo(
+            self,
+            callback: types.CallbackQuery,
+            state: FSMContext
+    ) -> None:
+        """Переход к вводу промокода."""
+        from infrastructure.telegram.keyboards import get_promo_code_keyboard
+
+        keyboard = await get_promo_code_keyboard()
+
+        await callback.message.edit_text(
+            "🎁 Введите промокод или выберите из популярных:",
+            reply_markup=keyboard
+        )
+
+    async def _skip_onboarding(
+            self,
+            callback: types.CallbackQuery,
+            state: FSMContext
+    ) -> None:
+        """Пропуск онбординга."""
+        # Очищаем состояние
+        await state.clear()
+
+        text = (
+            "Хорошо! Вы всегда можете заполнить данные позже "
+            "в настройках профиля.\n\n"
+            "Чем могу помочь?"
         )
 
         # Показываем главное меню
-        keyboard = await Keyboards.main_menu()
+        keyboard = await get_main_menu()
 
-        await message.answer(
-            "Теперь ты можешь использовать все возможности бота!",
-            reply_markup=keyboard,
-            parse_mode="MarkdownV2"
+        await edit_or_send_message(
+            callback.message,
+            text,
+            reply_markup=keyboard
         )
+
+    async def _save_birth_data(
+            self,
+            message: types.Message,
+            state: FSMContext
+    ) -> None:
+        """Сохранение данных рождения."""
+        data = await state.get_data()
+
+        # Сохраняем в БД
+        async with get_unit_of_work() as uow:
+            user = await uow.users.get_by_telegram_id(message.chat.id)
+
+            if user:
+                # Обновляем данные
+                if 'birth_date' in data:
+                    user.birth_date = data['birth_date']
+                if 'birth_time' in data:
+                    user.birth_time = data['birth_time']
+                if 'birth_place' in data:
+                    user.birth_place = data['birth_place']['name']
+                    user.birth_lat = data['birth_place']['lat']
+                    user.birth_lon = data['birth_place']['lon']
+
+                await uow.users.update(user)
+                await uow.commit()
 
         # Очищаем состояние
         await state.clear()
 
-    # Заглушки для остальных состояний
+        # Показываем главное меню
+        keyboard = await get_main_menu(user_subscription="free")
+
+        await message.answer(
+            "✅ Отлично! Данные сохранены.\n\n"
+            "Теперь вы можете получать персональные прогнозы!",
+            reply_markup=keyboard
+        )
+
+    # Обработчики состояний (оставляем для совместимости)
+
+    async def process_name(
+            self,
+            message: types.Message,
+            state: FSMContext
+    ) -> None:
+        """Обработка имени пользователя."""
+        name = message.text.strip()
+
+        # Валидация имени
+        if len(name) < 2:
+            await message.answer("Имя слишком короткое. Попробуйте еще раз:")
+            return
+
+        if len(name) > 50:
+            await message.answer("Имя слишком длинное. Попробуйте еще раз:")
+            return
+
+        # Сохраняем имя
+        await state.update_data(user_name=name)
+
+        # Показываем клавиатуру данных рождения
+        current_data = await state.get_data()
+        keyboard = await get_birth_data_keyboard(current_data=current_data)
+
+        await message.answer(
+            f"Приятно познакомиться, {name}! 😊\n\n"
+            f"Теперь давайте заполним данные для астрологических расчетов:",
+            reply_markup=keyboard
+        )
+
     async def process_birth_date(
             self,
             message: types.Message,
             state: FSMContext
     ) -> None:
-        """Обработка даты рождения."""
-        # TODO: Реализовать обработку даты
-        await message.answer("Обработка даты рождения...")
+        """Обработка даты рождения (текстовый ввод)."""
+        date_text = message.text.strip()
+
+        # Валидация даты
+        date_pattern = r'^\d{2}\.\d{2}\.\d{4}$'
+        if not re.match(date_pattern, date_text):
+            await message.answer(
+                "Неверный формат даты. Используйте ДД.ММ.ГГГГ\n"
+                "Например: 15.03.1990"
+            )
+            return
+
+        try:
+            birth_date = datetime.strptime(date_text, "%d.%m.%Y").date()
+
+            # Проверяем корректность даты
+            age = (datetime.now().date() - birth_date).days / 365.25
+            if age < 1 or age > 120:
+                await message.answer("Пожалуйста, введите корректную дату рождения")
+                return
+
+        except ValueError:
+            await message.answer("Некорректная дата. Попробуйте еще раз:")
+            return
+
+        # Сохраняем дату
+        await state.update_data(birth_date=birth_date)
+
+        # Обновляем клавиатуру
+        current_data = await state.get_data()
+        keyboard = await get_birth_data_keyboard(current_data=current_data)
+
+        await message.answer(
+            "✅ Дата сохранена!",
+            reply_markup=keyboard
+        )
 
     async def process_birth_time(
             self,
             message: types.Message,
             state: FSMContext
     ) -> None:
-        """Обработка времени рождения."""
-        # TODO: Реализовать обработку времени
-        await message.answer("Обработка времени рождения...")
+        """Обработка времени рождения (текстовый ввод)."""
+        time_text = message.text.strip()
+
+        # Валидация времени
+        time_pattern = r'^\d{1,2}:\d{2}$'
+        if not re.match(time_pattern, time_text):
+            await message.answer(
+                "Неверный формат времени. Используйте ЧЧ:ММ\n"
+                "Например: 14:30"
+            )
+            return
+
+        try:
+            birth_time = datetime.strptime(time_text, "%H:%M").time()
+        except ValueError:
+            await message.answer("Некорректное время. Попробуйте еще раз:")
+            return
+
+        # Сохраняем время
+        await state.update_data(birth_time=birth_time)
+
+        # Обновляем клавиатуру
+        current_data = await state.get_data()
+        keyboard = await get_birth_data_keyboard(current_data=current_data)
+
+        await message.answer(
+            "✅ Время сохранено!",
+            reply_markup=keyboard
+        )
 
     async def process_birth_place(
             self,
             message: types.Message,
             state: FSMContext
     ) -> None:
-        """Обработка места рождения."""
-        # TODO: Реализовать обработку места
-        await message.answer("Обработка места рождения...")
+        """Обработка места рождения (текстовый ввод)."""
+        place = message.text.strip()
+
+        if len(place) < 2:
+            await message.answer("Название слишком короткое. Попробуйте еще раз:")
+            return
+
+        # TODO: Здесь должен быть геокодинг для получения координат
+        # Пока сохраняем только название
+        await state.update_data(
+            birth_place={
+                "name": place,
+                "lat": 0.0,  # TODO: получить из API
+                "lon": 0.0   # TODO: получить из API
+            }
+        )
+
+        # Обновляем клавиатуру
+        current_data = await state.get_data()
+        keyboard = await get_birth_data_keyboard(current_data=current_data)
+
+        await message.answer(
+            "✅ Место сохранено!",
+            reply_markup=keyboard
+        )
+
+    async def _complete_onboarding(
+            self,
+            message: types.Message,
+            state: FSMContext
+    ) -> None:
+        """Завершение онбординга."""
+        # Получаем все данные
+        data = await state.get_data()
+
+        # Сохраняем в БД
+        async with get_unit_of_work() as uow:
+            user = await uow.users.get_by_telegram_id(message.from_user.id)
+
+            if user:
+                # Обновляем данные пользователя
+                if 'user_name' in data:
+                    user.display_name = data['user_name']
+                if 'birth_date' in data:
+                    user.birth_date = data['birth_date']
+                if 'birth_time' in data:
+                    user.birth_time = data['birth_time']
+                if 'birth_place' in data:
+                    user.birth_place = data['birth_place']['name']
+                    user.birth_lat = data['birth_place'].get('lat', 0.0)
+                    user.birth_lon = data['birth_place'].get('lon', 0.0)
+
+                await uow.users.update(user)
+                await uow.commit()
+
+        # Очищаем состояние
+        await state.clear()
+
+        # Поздравляем с завершением
+        text = (
+            "🎉 Отлично! Регистрация завершена!\n\n"
+            "Теперь вам доступны все возможности бота:\n"
+            "• Персональные гороскопы\n"
+            "• Натальная карта\n"
+            "• Расклады Таро\n"
+            "• И многое другое!\n\n"
+            "С чего начнем?"
+        )
+
+        # Показываем главное меню
+        keyboard = await get_main_menu(
+            user_subscription=user.subscription_plan if hasattr(user, 'subscription_plan') else 'free',
+            user_name=user.display_name if hasattr(user, 'display_name') else message.from_user.first_name
+        )
+
+        await message.answer(text, reply_markup=keyboard)
+
+        # Логируем завершение онбординга
+        await self.log_action(
+            message.from_user.id,
+            "onboarding_completed",
+            data
+        )
+
+    # Вспомогательные методы
+
+    def _get_time_based_greeting(self) -> str:
+        """Получить приветствие на основе времени суток."""
+        hour = datetime.now().hour
+
+        if 5 <= hour < 12:
+            return "Доброе утро"
+        elif 12 <= hour < 17:
+            return "Добрый день"
+        elif 17 <= hour < 22:
+            return "Добрый вечер"
+        else:
+            return "Доброй ночи"
+
+    def _calculate_days_since_last_visit(self, user: Any) -> int:
+        """Рассчитать дни с последнего визита."""
+        if hasattr(user, 'last_active_at') and user.last_active_at:
+            return (datetime.now() - user.last_active_at).days
+        return 0
+
+    async def _onboarding_back(
+            self,
+            callback: types.CallbackQuery,
+            state: FSMContext
+    ) -> None:
+        """Возврат на предыдущий шаг онбординга."""
+        # TODO: Реализовать логику возврата
+        await callback.answer("Функция в разработке")
+
+    async def _handle_interest_selection(
+            self,
+            callback: types.CallbackQuery,
+            interest: str,
+            state: FSMContext
+    ) -> None:
+        """Обработка выбора интересов."""
+        # TODO: Реализовать выбор интересов
+        await callback.answer(f"Выбран интерес: {interest}")
 
 
 # Функция для регистрации обработчика

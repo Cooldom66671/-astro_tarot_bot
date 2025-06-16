@@ -31,7 +31,7 @@ from datetime import datetime, date, time, timedelta
 from typing import Optional, List, Dict, Any
 from enum import Enum
 
-from pydantic import BaseModel, Field, validator, root_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from config import (
     logger,
@@ -90,7 +90,8 @@ class BirthData(BaseModel):
         description="Часовой пояс места рождения"
     )
 
-    @validator('name')
+    @field_validator('name')
+    @classmethod
     def validate_name(cls, v: str) -> str:
         """Валидация имени."""
         v = v.strip()
@@ -98,7 +99,8 @@ class BirthData(BaseModel):
             raise ValueError(ErrorMessages.INVALID_NAME)
         return v
 
-    @validator('date')
+    @field_validator('date')
+    @classmethod
     def validate_date(cls, v: date) -> date:
         """Валидация даты рождения."""
         # Проверяем, что дата не в будущем
@@ -112,16 +114,12 @@ class BirthData(BaseModel):
 
         return v
 
-    @root_validator
-    def validate_coordinates(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+    @model_validator(mode='after')
+    def validate_coordinates(self) -> 'BirthData':
         """Проверка, что координаты либо обе заданы, либо обе None."""
-        lat = values.get('latitude')
-        lon = values.get('longitude')
-
-        if (lat is None) != (lon is None):
+        if (self.latitude is None) != (self.longitude is None):
             raise ValueError("Широта и долгота должны быть указаны вместе")
-
-        return values
+        return self
 
     @property
     def has_exact_time(self) -> bool:
@@ -231,7 +229,8 @@ class UserSettings(BaseModel):
         description="Время напоминания"
     )
 
-    @validator('language')
+    @field_validator('language')
+    @classmethod
     def validate_language(cls, v: str) -> str:
         """Валидация языка."""
         supported_languages = ["ru", "en"]  # Пока только русский

@@ -36,7 +36,6 @@ from .keyboards import (
     # Астрология
     BirthDataKeyboard,
     HoroscopeType,
-    ZodiacSign,
 
     # Подписка
     SubscriptionPlansKeyboard,

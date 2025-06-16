@@ -28,9 +28,14 @@ import redis.asyncio as redis
 from redis.asyncio.connection import ConnectionPool
 
 from config import logger, settings
-from core.exceptions import CacheError
 
 T = TypeVar('T')
+
+
+# Определяем исключение для кэша локально
+class CacheError(Exception):
+    """Ошибка работы с кэшем."""
+    pass
 
 
 class CacheBackend(ABC):
@@ -122,6 +127,7 @@ class RedisBackend(CacheBackend):
         """
         self.url = url or settings.redis.url
         self.key_prefix = key_prefix
+        self.max_connections = max_connections  # Сохраняем как атрибут
         self.pool: Optional[ConnectionPool] = None
         self.client: Optional[redis.Redis] = None
         self._stats = {
@@ -138,7 +144,7 @@ class RedisBackend(CacheBackend):
         if not self.client:
             self.pool = ConnectionPool.from_url(
                 self.url,
-                max_connections=max_connections,
+                max_connections=self.max_connections,  # Используем атрибут
                 decode_responses=False  # Для поддержки бинарных данных
             )
             self.client = redis.Redis(connection_pool=self.pool)
@@ -567,8 +573,9 @@ class CacheManager:
         if self._initialized:
             return
 
-        # Пробуем Redis
-        if settings.redis.enabled:
+        # Пробуем Redis если URL указан
+        redis_url = settings.redis.url
+        if redis_url and redis_url != "redis://localhost:6379/0":  # Не default
             try:
                 self.backend = RedisBackend()
                 await self.backend.connect()
@@ -579,9 +586,12 @@ class CacheManager:
 
         # Fallback на in-memory
         if not self.backend:
-            self.backend = InMemoryBackend(
-                max_size=settings.cache.max_memory_items
-            )
+            # Используем настройку из Redis если есть, иначе default
+            max_size = 10000
+            if hasattr(settings.redis, 'cache_max_size'):
+                max_size = settings.redis.cache_max_size
+
+            self.backend = InMemoryBackend(max_size=max_size)
             self.is_redis = False
             logger.info("Используется in-memory backend для кэша")
 
@@ -609,6 +619,10 @@ class CacheManager:
             tags: Теги для группировки
         """
         await self.init()
+
+        # Используем TTL из настроек если не передан
+        if ttl is None and hasattr(settings.redis, 'cache_ttl'):
+            ttl = settings.redis.cache_ttl
 
         result = await self.backend.set(key, value, ttl)
 
@@ -688,9 +702,9 @@ class CacheManager:
                 cache_key = hashlib.md5(cache_key.encode()).hexdigest()
 
                 # Проверяем кэш
-                cached = await self.get(cache_key)
-                if cached is not None:
-                    return cached
+                cached_value = await self.get(cache_key)
+                if cached_value is not None:
+                    return cached_value
 
                 # Вызываем функцию
                 result = await func(*args, **kwargs)

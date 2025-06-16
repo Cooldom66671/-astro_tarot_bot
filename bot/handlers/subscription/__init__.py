@@ -20,22 +20,36 @@ from decimal import Decimal
 import asyncio
 import uuid
 
-from aiogram import Router, F
+from aiogram import Router, F, Bot
 from aiogram.filters import Command, StateFilter
-from aiogram.types import Message, CallbackQuery, LabeledPrice, PreCheckoutQuery
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    LabeledPrice,
+    PreCheckoutQuery
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
-from bot.handlers.base import BaseHandler, error_handler
-from bot.states import SubscriptionStates
-from infrastructure.telegram import (
+from bot.handlers.base import (
+    BaseHandler,
+    error_handler,
+    log_action,
+    get_or_create_user,
+    answer_callback_query,
+    edit_or_send_message
+)
+from bot.states import SubscriptionStates, FeedbackStates
+from infrastructure.telegram.keyboards import (
     Keyboards,
-    MessageFactory,
-    MessageBuilder,
-    MessageStyle,
-    MessageEmoji as Emoji
+    InlineKeyboard,
+    SubscriptionCallbackData,
+    PaymentCallbackData,
+    PromoCallbackData
 )
 from infrastructure import get_unit_of_work
+from services import get_payment_service
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -109,121 +123,123 @@ class SubscriptionHandlers(BaseHandler):
         "FRIEND": {"discount": 30, "type": "percent", "plans": ["all"]}
     }
 
-    def register_handlers(self, router: Router) -> None:
+    def register_handlers(self) -> None:
         """Регистрация обработчиков подписки."""
         # Команда /subscription
-        router.message.register(
+        self.router.message.register(
             self.cmd_subscription,
             Command("subscription")
         )
 
         # Главное меню подписки
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.show_subscription_menu,
             F.data == "subscription_menu"
         )
 
         # Просмотр планов
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.show_plans,
             F.data == "show_plans"
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.show_plan_details,
             F.data.startswith("plan_details:")
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.compare_plans,
             F.data == "compare_plans"
         )
 
         # Покупка подписки
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.select_plan_to_buy,
             F.data.startswith("buy_plan:")
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.select_payment_period,
             F.data.startswith("payment_period:")
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.select_payment_method,
             F.data.startswith("payment_method:")
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.process_payment,
             F.data.startswith("process_payment:")
         )
 
         # Промокоды
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.enter_promo_code,
             F.data == "enter_promo"
         )
 
-        router.message.register(
+        self.router.message.register(
             self.validate_promo_code,
             StateFilter(SubscriptionStates.waiting_for_promo)
         )
 
         # Управление подпиской
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.show_current_subscription,
             F.data == "current_subscription"
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.toggle_auto_renew,
             F.data == "toggle_auto_renew"
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.extend_subscription,
             F.data == "extend_subscription"
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.upgrade_subscription,
             F.data == "upgrade_subscription"
         )
 
         # История платежей
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.show_payment_history,
             F.data == "payment_history"
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.show_payment_details,
             F.data.startswith("payment_details:")
         )
 
         # Отмена подписки
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.start_cancellation,
             F.data == "cancel_subscription"
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.confirm_cancellation,
             F.data.startswith("confirm_cancel:")
         )
 
         # Обработчики платежей
-        router.pre_checkout_query.register(
+        self.router.pre_checkout_query.register(
             self.pre_checkout_handler
         )
 
-        router.message.register(
+        self.router.message.register(
             self.successful_payment_handler,
             F.successful_payment
         )
 
+    @error_handler()
+    @log_action("subscription_command")
     async def cmd_subscription(
             self,
             message: Message,
@@ -234,15 +250,21 @@ class SubscriptionHandlers(BaseHandler):
         await state.clear()
 
         async with get_unit_of_work() as uow:
-            user = await self.get_or_create_user(uow, message.from_user)
-            subscription = await uow.subscriptions.get_active(user.id)
+            user = await get_or_create_user(message.from_user)
+            user_db = await uow.users.get_by_telegram_id(message.from_user.id)
 
+            if user_db:
+                subscription = await uow.subscriptions.get_active_by_user_id(user_db.id)
+            else:
+                subscription = None
+
+            # Используем фабрику клавиатур
             keyboard = await Keyboards.subscription_menu(
-                current_plan=user.subscription_plan,
-                subscription=subscription
+                current_plan=user_db.subscription_plan if user_db and hasattr(user_db, 'subscription_plan') else None,
+                has_subscription=bool(subscription and subscription.is_active)
             )
 
-            text = await self._format_subscription_status(user, subscription)
+            text = self._format_subscription_status(user_db, subscription)
 
             await message.answer(
                 text,
@@ -250,6 +272,7 @@ class SubscriptionHandlers(BaseHandler):
                 parse_mode="HTML"
             )
 
+    @error_handler()
     async def show_subscription_menu(
             self,
             callback: CallbackQuery,
@@ -261,136 +284,151 @@ class SubscriptionHandlers(BaseHandler):
 
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
-            subscription = await uow.subscriptions.get_active(user.id)
 
+            if not user:
+                await answer_callback_query(callback, "Необходимо начать с /start", show_alert=True)
+                return
+
+            subscription = await uow.subscriptions.get_active_by_user_id(user.id)
+
+            # Используем фабрику клавиатур
             keyboard = await Keyboards.subscription_menu(
-                current_plan=user.subscription_plan,
-                subscription=subscription
+                current_plan=user.subscription_plan if hasattr(user, 'subscription_plan') else None,
+                has_subscription=bool(subscription and subscription.is_active)
             )
 
-            text = await self._format_subscription_status(user, subscription)
+            text = self._format_subscription_status(user, subscription)
 
-            await self.edit_or_send_message(
-                callback,
+            await edit_or_send_message(
+                callback.message,
                 text,
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
 
+        await answer_callback_query(callback)
+
+    @error_handler()
     async def show_plans(
             self,
             callback: CallbackQuery,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Показать доступные планы подписки."""
-        async with get_unit_of_work() as uow:
-            user = await uow.users.get_by_telegram_id(callback.from_user.id)
+        text = (
+            "💎 <b>Тарифные планы</b>\n\n"
+            "Выберите подходящий план:"
+        )
 
-            keyboard = await Keyboards.subscription_plans(
-                current_plan=user.subscription_plan
-            )
+        # Используем фабрику клавиатур
+        keyboard = await Keyboards.subscription_plans(
+            plans=self.SUBSCRIPTION_PLANS,
+            current_plan=None
+        )
 
-            text = await self._format_plans_overview()
-
-            await self.edit_or_send_message(
-                callback,
-                text,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-
-    async def show_plan_details(
-            self,
-            callback: CallbackQuery,
-            **kwargs
-    ) -> None:
-        """Показать детали конкретного плана."""
-        plan_name = callback.data.split(":")[1]
-
-        if plan_name not in self.SUBSCRIPTION_PLANS:
-            await callback.answer("План не найден", show_alert=True)
-            return
-
-        plan = self.SUBSCRIPTION_PLANS[plan_name]
-
-        async with get_unit_of_work() as uow:
-            user = await uow.users.get_by_telegram_id(callback.from_user.id)
-
-            keyboard = await Keyboards.plan_details(
-                plan_name=plan_name,
-                can_buy=user.subscription_plan != plan_name
-            )
-
-            text = await self._format_plan_details(plan_name, plan)
-
-            await self.edit_or_send_message(
-                callback,
-                text,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-
-    async def compare_plans(
-            self,
-            callback: CallbackQuery,
-            **kwargs
-    ) -> None:
-        """Показать сравнение планов."""
-        text = await self._format_plans_comparison()
-
-        keyboard = await Keyboards.back_button("show_plans")
-
-        await self.edit_or_send_message(
-            callback,
+        await edit_or_send_message(
+            callback.message,
             text,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
 
+        await answer_callback_query(callback)
+
+    @error_handler()
+    async def show_plan_details(
+            self,
+            callback: CallbackQuery,
+            state: FSMContext,
+            **kwargs
+    ) -> None:
+        """Показать детали плана."""
+        plan_name = callback.data.split(":")[1]
+
+        if plan_name not in self.SUBSCRIPTION_PLANS:
+            await answer_callback_query(callback, "План не найден", show_alert=True)
+            return
+
+        plan = self.SUBSCRIPTION_PLANS[plan_name]
+
+        text = self._format_plan_details(plan_name, plan)
+
+        # Используем фабрику клавиатур
+        keyboard = await Keyboards.plan_details(
+            plan_name=plan_name,
+            plan_info=plan
+        )
+
+        await edit_or_send_message(
+            callback.message,
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+        await answer_callback_query(callback)
+
+    @error_handler()
+    async def compare_plans(
+            self,
+            callback: CallbackQuery,
+            state: FSMContext,
+            **kwargs
+    ) -> None:
+        """Сравнить все планы."""
+        text = self._format_plans_comparison()
+
+        # Используем фабрику клавиатур
+        keyboard = await Keyboards.compare_plans_menu()
+
+        await edit_or_send_message(
+            callback.message,
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+        await answer_callback_query(callback)
+
+    @error_handler()
     async def select_plan_to_buy(
             self,
             callback: CallbackQuery,
             state: FSMContext,
             **kwargs
     ) -> None:
-        """Начать процесс покупки плана."""
+        """Выбор плана для покупки."""
         plan_name = callback.data.split(":")[1]
 
-        async with get_unit_of_work() as uow:
-            user = await uow.users.get_by_telegram_id(callback.from_user.id)
+        if plan_name not in self.SUBSCRIPTION_PLANS:
+            await answer_callback_query(callback, "План не найден", show_alert=True)
+            return
 
-            # Проверяем, не активен ли уже этот план
-            if user.subscription_plan == plan_name:
-                await callback.answer(
-                    "У вас уже активен этот план",
-                    show_alert=True
-                )
-                return
+        # Сохраняем выбранный план
+        await state.update_data(selected_plan=plan_name)
 
-            # Сохраняем выбранный план
-            await state.update_data(
-                selected_plan=plan_name,
-                base_price=self.SUBSCRIPTION_PLANS[plan_name]["price"]
-            )
+        text = (
+            "📅 <b>Выберите период подписки</b>\n\n"
+            "Чем дольше период, тем выгоднее!"
+        )
 
-            # Показываем выбор периода
-            keyboard = await Keyboards.payment_period_selection(plan_name)
+        # Используем фабрику клавиатур
+        keyboard = await Keyboards.payment_period_selection(
+            plan_name=plan_name,
+            base_price=self.SUBSCRIPTION_PLANS[plan_name]["price"]
+        )
 
-            text = (
-                f"<b>Выберите период оплаты</b>\n\n"
-                f"План: <b>{self.SUBSCRIPTION_PLANS[plan_name]['name']}</b>\n\n"
-                f"💡 При оплате на длительный период действуют скидки:\n"
-                f"• 3 месяца - скидка 10%\n"
-                f"• 12 месяцев - скидка 20%"
-            )
+        await edit_or_send_message(
+            callback.message,
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
 
-            await self.edit_or_send_message(
-                callback,
-                text,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
+        await answer_callback_query(callback)
 
+    @error_handler()
     async def select_payment_period(
             self,
             callback: CallbackQuery,
@@ -398,53 +436,106 @@ class SubscriptionHandlers(BaseHandler):
             **kwargs
     ) -> None:
         """Выбор периода оплаты."""
-        period = callback.data.split(":")[1]  # 1m, 3m, 12m
+        parts = callback.data.split(":")
+        plan_name = parts[1]
+        period = parts[2]
 
-        data = await state.get_data()
-        plan_name = data["selected_plan"]
-        base_price = data["base_price"]
+        # Сохраняем период
+        await state.update_data(payment_period=period)
 
-        # Рассчитываем цену с учетом периода
-        period_multipliers = {"1m": 1, "3m": 3, "12m": 12}
-        period_discounts = {"1m": 0, "3m": 10, "12m": 20}
+        # Рассчитываем стоимость
+        base_price = self.SUBSCRIPTION_PLANS[plan_name]["price"]
+        total_price = self._calculate_price(base_price, period)
 
-        multiplier = period_multipliers[period]
-        discount = period_discounts[period]
-
-        total_price = base_price * multiplier
-        discount_amount = total_price * discount / 100
-        final_price = total_price - discount_amount
-
-        await state.update_data(
-            payment_period=period,
-            total_price=total_price,
-            discount_amount=discount_amount,
-            final_price=final_price,
-            promo_code=None,
-            promo_discount=0
+        text = (
+            "💳 <b>Выберите способ оплаты</b>\n\n"
+            f"К оплате: <b>{total_price} ₽</b>"
         )
 
-        # Показываем выбор способа оплаты
+        # Используем фабрику клавиатур
         keyboard = await Keyboards.payment_method_selection(
-            amount=final_price,
-            has_saved_cards=False  # TODO: проверить сохраненные карты
+            plan_name=plan_name,
+            period=period,
+            amount=total_price
         )
 
-        text = await self._format_payment_summary(
-            plan_name,
-            period,
-            total_price,
-            discount_amount,
-            final_price
-        )
-
-        await self.edit_or_send_message(
-            callback,
+        await edit_or_send_message(
+            callback.message,
             text,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
 
+        await answer_callback_query(callback)
+
+    @error_handler()
+    async def process_payment(
+            self,
+            callback: CallbackQuery,
+            state: FSMContext,
+            **kwargs
+    ) -> None:
+        """Обработка платежа."""
+        parts = callback.data.split(":")
+        plan_name = parts[1]
+        period = parts[2]
+        method = parts[3]
+
+        plan = self.SUBSCRIPTION_PLANS[plan_name]
+        price = self._calculate_price(plan["price"], period)
+
+        if method == "telegram":
+            # Создаем счет для оплаты через Telegram
+            bot = Bot.get_current()
+
+            await bot.send_invoice(
+                chat_id=callback.from_user.id,
+                title=f"Подписка {plan['name']}",
+                description=f"Подписка на {self._get_period_name(period)}",
+                payload=f"{plan_name}:{period}",
+                provider_token=settings.payment.provider_token,
+                currency="RUB",
+                prices=[LabeledPrice(label=f"Подписка {plan['name']}", amount=price * 100)]
+            )
+
+            await answer_callback_query(callback, "Счет отправлен")
+
+        elif method == "yoomoney":
+            # Генерируем ссылку на оплату через ЮMoney
+            payment_service = get_payment_service()
+            payment_url = await payment_service.create_yoomoney_payment(
+                amount=price,
+                description=f"Подписка {plan['name']} на {self._get_period_name(period)}",
+                user_id=callback.from_user.id,
+                plan_name=plan_name,
+                period=period
+            )
+
+            # Создаем клавиатуру с URL кнопкой
+            keyboard = InlineKeyboard()
+            keyboard.add_url_button(text="💳 Оплатить", url=payment_url)
+            keyboard.add_button(
+                text="◀️ Назад",
+                callback_data=f"payment_period:{plan_name}:{period}"
+            )
+            keyboard.builder.adjust(1)
+
+            text = (
+                "💳 <b>Оплата через ЮMoney</b>\n\n"
+                f"Сумма к оплате: <b>{price} ₽</b>\n\n"
+                "Нажмите кнопку ниже для перехода к оплате:"
+            )
+
+            await edit_or_send_message(
+                callback.message,
+                text,
+                reply_markup=await keyboard.build(),
+                parse_mode="HTML"
+            )
+
+            await answer_callback_query(callback)
+
+    @error_handler()
     async def enter_promo_code(
             self,
             callback: CallbackQuery,
@@ -452,94 +543,50 @@ class SubscriptionHandlers(BaseHandler):
             **kwargs
     ) -> None:
         """Ввод промокода."""
-        await state.set_state(SubscriptionStates.waiting_for_promo)
-
         text = (
-            f"<b>{Emoji.GIFT} Введите промокод</b>\n\n"
-            f"Отправьте промокод для получения скидки.\n"
-            f"Промокод должен быть активным и подходить "
-            f"для выбранного тарифа.\n\n"
-            f"<i>Отправьте /cancel для отмены</i>"
+            "🎟 <b>Введите промокод</b>\n\n"
+            "Отправьте промокод в чат:"
         )
 
-        keyboard = await Keyboards.cancel_only()
+        # Используем кнопку отмены
+        keyboard = await Keyboards.cancel("subscription_menu")
 
-        await self.edit_or_send_message(
-            callback,
+        await edit_or_send_message(
+            callback.message,
             text,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
 
+        await state.set_state(SubscriptionStates.waiting_for_promo)
+        await answer_callback_query(callback)
+
+    @error_handler()
     async def validate_promo_code(
             self,
             message: Message,
-            state: FSMContext,
-            **kwargs
+            state: FSMContext
     ) -> None:
-        """Проверка и применение промокода."""
+        """Проверка промокода."""
         promo_code = message.text.strip().upper()
 
-        data = await state.get_data()
-        plan_name = data["selected_plan"]
+        if promo_code in self.PROMO_CODES:
+            promo = self.PROMO_CODES[promo_code]
 
-        # Проверяем промокод
-        if promo_code not in self.PROMO_CODES:
-            await message.answer(
-                f"{Emoji.ERROR} Промокод не найден или недействителен.\n"
-                f"Попробуйте другой код или продолжите без промокода."
+            text = (
+                "✅ <b>Промокод активирован!</b>\n\n"
+                f"Скидка: {promo['discount']}{'%' if promo['type'] == 'percent' else ' ₽'}\n"
             )
-            return
 
-        promo_data = self.PROMO_CODES[promo_code]
-
-        # Проверяем применимость к плану
-        if "all" not in promo_data["plans"] and plan_name not in promo_data["plans"]:
-            await message.answer(
-                f"{Emoji.ERROR} Этот промокод не применим к плану "
-                f"{self.SUBSCRIPTION_PLANS[plan_name]['name']}.\n"
-                f"Попробуйте другой код."
-            )
-            return
-
-        # Рассчитываем скидку
-        final_price = data["final_price"]
-
-        if promo_data["type"] == "percent":
-            promo_discount = final_price * promo_data["discount"] / 100
+            # Сохраняем промокод в состоянии
+            await state.update_data(promo_code=promo_code)
         else:
-            promo_discount = promo_data["discount"]
+            text = "❌ Промокод не найден или недействителен"
 
-        new_final_price = max(1, final_price - promo_discount)  # Минимум 1 рубль
+        await state.clear()
 
-        await state.update_data(
-            promo_code=promo_code,
-            promo_discount=promo_discount,
-            final_price=new_final_price
-        )
-
-        await state.set_state(None)
-
-        # Обновляем сводку оплаты
-        keyboard = await Keyboards.payment_method_selection(
-            amount=new_final_price,
-            has_saved_cards=False,
-            promo_applied=True
-        )
-
-        text = await self._format_payment_summary(
-            plan_name,
-            data["payment_period"],
-            data["total_price"],
-            data["discount_amount"],
-            new_final_price,
-            promo_code,
-            promo_discount
-        )
-
-        await message.answer(
-            f"{Emoji.CHECK} Промокод применен! Скидка {promo_data['discount']}%"
-        )
+        # Используем фабрику клавиатур
+        keyboard = await Keyboards.promo_result(success=promo_code in self.PROMO_CODES)
 
         await message.answer(
             text,
@@ -547,175 +594,165 @@ class SubscriptionHandlers(BaseHandler):
             parse_mode="HTML"
         )
 
-    async def select_payment_method(
-            self,
-            callback: CallbackQuery,
-            state: FSMContext,
-            **kwargs
-    ) -> None:
-        """Выбор способа оплаты."""
-        method = callback.data.split(":")[1]
-
-        data = await state.get_data()
-        await state.update_data(payment_method=method)
-
-        # В зависимости от метода запускаем соответствующий процесс
-        if method == "telegram_stars":
-            await self._process_telegram_stars_payment(callback, state)
-        elif method == "yookassa":
-            await self._process_yookassa_payment(callback, state)
-        elif method == "crypto":
-            await self._process_crypto_payment(callback, state)
-        else:
-            await callback.answer(
-                "Этот способ оплаты временно недоступен",
-                show_alert=True
-            )
-
+    @error_handler()
     async def show_current_subscription(
             self,
             callback: CallbackQuery,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Показать текущую подписку."""
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
-            subscription = await uow.subscriptions.get_active(user.id)
 
-            if not subscription:
-                await callback.answer(
-                    "У вас нет активной подписки",
-                    show_alert=True
-                )
+            if not user:
+                await answer_callback_query(callback, "Пользователь не найден", show_alert=True)
                 return
 
-            # Получаем статистику использования
-            usage_stats = await uow.subscriptions.get_usage_stats(
-                user.id,
-                subscription.id
-            )
+            subscription = await uow.subscriptions.get_active_by_user_id(user.id)
 
-            keyboard = await Keyboards.current_subscription_management(
+            if not subscription:
+                await answer_callback_query(callback, "У вас нет активной подписки", show_alert=True)
+                return
+
+            text = self._format_current_subscription(subscription)
+
+            # Используем фабрику клавиатур
+            keyboard = await Keyboards.subscription_management(
                 subscription=subscription,
-                can_upgrade=user.subscription_plan != "vip"
+                auto_renew=subscription.auto_renew
             )
 
-            text = await self._format_current_subscription(
-                subscription,
-                usage_stats
-            )
-
-            await self.edit_or_send_message(
-                callback,
+            await edit_or_send_message(
+                callback.message,
                 text,
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
 
+        await answer_callback_query(callback)
+
+    @error_handler()
     async def toggle_auto_renew(
             self,
             callback: CallbackQuery,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Переключить автопродление."""
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
-            subscription = await uow.subscriptions.get_active(user.id)
+
+            if not user:
+                await answer_callback_query(callback, "Пользователь не найден", show_alert=True)
+                return
+
+            subscription = await uow.subscriptions.get_active_by_user_id(user.id)
 
             if not subscription:
-                await callback.answer("Подписка не найдена", show_alert=True)
+                await answer_callback_query(callback, "Подписка не найдена", show_alert=True)
                 return
 
             # Переключаем автопродление
             subscription.auto_renew = not subscription.auto_renew
+            await uow.subscriptions.update(subscription)
             await uow.commit()
 
             status = "включено" if subscription.auto_renew else "выключено"
-            await callback.answer(
+            await answer_callback_query(
+                callback,
                 f"Автопродление {status}",
                 show_alert=False
             )
 
             # Обновляем меню
-            await self.show_current_subscription(callback)
+            await self.show_current_subscription(callback, state)
 
+    @error_handler()
     async def show_payment_history(
             self,
             callback: CallbackQuery,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Показать историю платежей."""
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
 
-            payments = await uow.payments.get_user_payments(
-                user.id,
-                limit=10
-            )
-
-            if not payments:
-                await callback.answer(
-                    "История платежей пуста",
-                    show_alert=True
-                )
+            if not user:
+                await answer_callback_query(callback, "Пользователь не найден", show_alert=True)
                 return
 
-            keyboard = await Keyboards.payment_history(
-                payments=payments,
-                page=1
-            )
+            payments = await uow.payments.get_user_payments(user.id, limit=10)
 
-            text = await self._format_payment_history(payments)
+            if not payments:
+                text = "📋 <b>История платежей</b>\n\nУ вас пока нет платежей."
+                keyboard = await Keyboards.back("subscription_menu")
+            else:
+                text = self._format_payment_history(payments)
+                # Используем фабрику клавиатур
+                keyboard = await Keyboards.payment_history(payments=payments[:5])
 
-            await self.edit_or_send_message(
-                callback,
+            await edit_or_send_message(
+                callback.message,
                 text,
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
 
+        await answer_callback_query(callback)
+
+    @error_handler()
     async def start_cancellation(
             self,
             callback: CallbackQuery,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Начать процесс отмены подписки."""
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
-            subscription = await uow.subscriptions.get_active(user.id)
+
+            if not user:
+                await answer_callback_query(callback, "Пользователь не найден", show_alert=True)
+                return
+
+            subscription = await uow.subscriptions.get_active_by_user_id(user.id)
 
             if not subscription:
-                await callback.answer(
-                    "У вас нет активной подписки",
-                    show_alert=True
-                )
+                await answer_callback_query(callback, "У вас нет активной подписки", show_alert=True)
                 return
 
             # Показываем причины и альтернативы
-            keyboard = await Keyboards.cancellation_reasons()
-
             text = (
-                f"<b>{Emoji.WARNING} Отмена подписки</b>\n\n"
-                f"Вы действительно хотите отменить подписку?\n\n"
-                f"<b>Что вы потеряете:</b>\n"
-                f"• Доступ к расширенным раскладам\n"
-                f"• Персональные прогнозы\n"
-                f"• История и статистика\n\n"
+                "⚠️ <b>Отмена подписки</b>\n\n"
+                "Вы действительно хотите отменить подписку?\n\n"
+                "<b>Что вы потеряете:</b>\n"
+                "• Доступ к расширенным раскладам\n"
+                "• Персональные прогнозы\n"
+                "• История и статистика\n\n"
                 f"Подписка будет активна до: "
-                f"{subscription.end_date.strftime('%d.%m.%Y')}\n\n"
-                f"Выберите причину отмены:"
+                f"{subscription.expires_at.strftime('%d.%m.%Y')}\n\n"
+                "Выберите причину отмены:"
             )
 
-            await self.edit_or_send_message(
-                callback,
+            # Используем фабрику клавиатур
+            keyboard = await Keyboards.cancellation_reasons()
+
+            await edit_or_send_message(
+                callback.message,
                 text,
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
 
+        await answer_callback_query(callback)
+
+    @error_handler()
     async def confirm_cancellation(
             self,
             callback: CallbackQuery,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Подтвердить отмену подписки."""
@@ -723,10 +760,15 @@ class SubscriptionHandlers(BaseHandler):
 
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
-            subscription = await uow.subscriptions.get_active(user.id)
+
+            if not user:
+                await answer_callback_query(callback, "Пользователь не найден", show_alert=True)
+                return
+
+            subscription = await uow.subscriptions.get_active_by_user_id(user.id)
 
             if not subscription:
-                await callback.answer("Подписка не найдена", show_alert=True)
+                await answer_callback_query(callback, "Подписка не найдена", show_alert=True)
                 return
 
             # Отменяем автопродление
@@ -734,31 +776,38 @@ class SubscriptionHandlers(BaseHandler):
             subscription.cancellation_reason = reason
             subscription.cancelled_at = datetime.utcnow()
 
+            await uow.subscriptions.update(subscription)
             await uow.commit()
 
             # Отправляем подтверждение
-            await callback.answer("Подписка отменена", show_alert=False)
-
-            keyboard = await Keyboards.subscription_cancelled()
-
             text = (
-                f"{Emoji.CHECK} <b>Подписка отменена</b>\n\n"
+                "✅ <b>Подписка отменена</b>\n\n"
                 f"Ваша подписка будет активна до "
-                f"{subscription.end_date.strftime('%d.%m.%Y')}.\n\n"
-                f"После этой даты доступ к платным функциям "
-                f"будет ограничен.\n\n"
-                f"Вы всегда можете возобновить подписку в любой момент!"
+                f"{subscription.expires_at.strftime('%d.%m.%Y')}.\n\n"
+                "После этой даты доступ к платным функциям "
+                "будет ограничен.\n\n"
+                "Вы всегда можете возобновить подписку в любой момент!"
             )
 
-            await self.edit_or_send_message(
-                callback,
+            # Используем фабрику клавиатур
+            keyboard = await Keyboards.subscription_cancelled()
+
+            await edit_or_send_message(
+                callback.message,
                 text,
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
 
+            # Сохраняем причину отмены для аналитики
+            await state.update_data(cancellation_reason=reason)
+            await state.set_state(FeedbackStates.waiting_for_text)
+
+        await answer_callback_query(callback, "Подписка отменена")
+
     # Обработчики платежей
 
+    @error_handler()
     async def pre_checkout_handler(
             self,
             pre_checkout_query: PreCheckoutQuery,
@@ -768,6 +817,7 @@ class SubscriptionHandlers(BaseHandler):
         # Проверяем, что платеж корректный
         await pre_checkout_query.answer(ok=True)
 
+    @error_handler()
     async def successful_payment_handler(
             self,
             message: Message,
@@ -777,7 +827,8 @@ class SubscriptionHandlers(BaseHandler):
         payment = message.successful_payment
 
         async with get_unit_of_work() as uow:
-            user = await self.get_or_create_user(uow, message.from_user)
+            user = await get_or_create_user(message.from_user)
+            user_db = await uow.users.get_by_telegram_id(message.from_user.id)
 
             # Парсим payload для получения деталей
             payload_parts = payment.invoice_payload.split(":")
@@ -786,7 +837,7 @@ class SubscriptionHandlers(BaseHandler):
 
             # Создаем запись о платеже
             payment_record = await uow.payments.create(
-                user_id=user.id,
+                user_id=user_db.id,
                 amount=payment.total_amount / 100,  # Копейки в рубли
                 currency=payment.currency,
                 provider=payment.provider_payment_charge_id,
@@ -800,28 +851,30 @@ class SubscriptionHandlers(BaseHandler):
             duration_days = duration_map.get(period, 30)
 
             subscription = await uow.subscriptions.activate_or_extend(
-                user_id=user.id,
+                user_id=user_db.id,
                 plan_name=plan_name,
                 duration_days=duration_days,
                 payment_id=payment_record.id
             )
 
             # Обновляем план пользователя
-            user.subscription_plan = plan_name
+            user_db.subscription_plan = plan_name
+            await uow.users.update(user_db)
 
             await uow.commit()
 
             # Отправляем подтверждение
-            keyboard = await Keyboards.payment_success()
-
             text = (
-                f"{Emoji.CHECK} <b>Оплата прошла успешно!</b>\n\n"
+                f"✅ <b>Оплата прошла успешно!</b>\n\n"
                 f"План: <b>{self.SUBSCRIPTION_PLANS[plan_name]['name']}</b>\n"
-                f"Действует до: {subscription.end_date.strftime('%d.%m.%Y')}\n\n"
+                f"Действует до: {subscription.expires_at.strftime('%d.%m.%Y')}\n\n"
                 f"Спасибо за доверие! Теперь вам доступны "
                 f"все возможности выбранного плана.\n\n"
                 f"Чек об оплате отправлен вам в личные сообщения."
             )
+
+            # Используем фабрику клавиатур
+            keyboard = await Keyboards.payment_success()
 
             await message.answer(
                 text,
@@ -831,312 +884,164 @@ class SubscriptionHandlers(BaseHandler):
 
     # Вспомогательные методы
 
-    async def _format_subscription_status(
+    def _format_subscription_status(
             self,
-            user,
+            user: Any,
             subscription: Optional[Any]
     ) -> str:
         """Форматировать статус подписки."""
-        builder = MessageBuilder(MessageStyle.HTML)
-
-        builder.add_bold(f"{Emoji.PAYMENT} Управление подпиской").add_line(2)
+        text = "💎 <b>Управление подпиской</b>\n\n"
 
         if subscription and subscription.is_active:
-            plan_name = self.SUBSCRIPTION_PLANS[user.subscription_plan]["name"]
-            days_left = (subscription.end_date - datetime.utcnow()).days
+            plan = self.SUBSCRIPTION_PLANS.get(subscription.plan_name, {})
 
-            builder.add_text(f"<b>Текущий план:</b> {plan_name}").add_line()
-            builder.add_text(
-                f"<b>Действует до:</b> "
-                f"{subscription.end_date.strftime('%d.%m.%Y')}"
-            ).add_line()
-            builder.add_text(f"<b>Осталось дней:</b> {days_left}").add_line()
+            text += (
+                f"<b>Текущий план:</b> {plan.get('name', subscription.plan_name)}\n"
+                f"<b>Действует до:</b> {subscription.expires_at.strftime('%d.%m.%Y')}\n"
+                f"<b>Автопродление:</b> {'Включено' if subscription.auto_renew else 'Выключено'}\n\n"
+            )
 
-            if subscription.auto_renew:
-                builder.add_text("✅ Автопродление включено").add_line()
-            else:
-                builder.add_text("❌ Автопродление выключено").add_line()
+            # Показываем оставшиеся дни
+            days_left = (subscription.expires_at - datetime.now()).days
+            if days_left <= 7:
+                text += f"⚠️ Осталось дней: {days_left}\n\n"
         else:
-            builder.add_text(
-                "У вас нет активной подписки.\n"
-                "Выберите подходящий план и откройте все возможности!"
-            ).add_line()
-
-        builder.add_line()
-        builder.add_italic("Выберите действие:")
-
-        return builder.build()
-
-    async def _format_plans_overview(self) -> str:
-        """Форматировать обзор планов."""
-        builder = MessageBuilder(MessageStyle.HTML)
-
-        builder.add_bold("Доступные планы подписки").add_line(2)
-
-        for plan_key, plan in self.SUBSCRIPTION_PLANS.items():
-            if plan_key == "basic":
-                emoji = "⭐"
-            elif plan_key == "premium":
-                emoji = "💎"
-            else:
-                emoji = "👑"
-
-            builder.add_bold(f"{emoji} {plan['name']} - {plan['price']} ₽/мес").add_line()
-            builder.add_list(plan["features"][:3])
-            builder.add_line()
-
-        builder.add_italic(
-            "Выберите план для подробной информации или "
-            "сравните все планы"
-        )
-
-        return builder.build()
-
-    async def _format_plan_details(
-            self,
-            plan_name: str,
-            plan: Dict[str, Any]
-    ) -> str:
-        """Форматировать детали плана."""
-        builder = MessageBuilder(MessageStyle.HTML)
-
-        emoji_map = {"basic": "⭐", "premium": "💎", "vip": "👑"}
-        emoji = emoji_map.get(plan_name, "📦")
-
-        builder.add_bold(f"{emoji} План {plan['name']}").add_line()
-        builder.add_text(f"<b>{plan['price']} ₽</b> в месяц").add_line(2)
-
-        builder.add_bold("Что входит:").add_line()
-        builder.add_list(plan["features"])
-        builder.add_line()
-
-        # Лимиты
-        builder.add_bold("Лимиты:").add_line()
-        limits = plan["limits"]
-
-        if limits["tarot_spreads"] == -1:
-            builder.add_text("• Расклады Таро: безлимит").add_line()
-        else:
-            builder.add_text(f"• Расклады Таро: {limits['tarot_spreads']}/мес").add_line()
-
-        if limits["horoscopes"] == "all":
-            builder.add_text("• Гороскопы: все типы").add_line()
-        else:
-            builder.add_text("• Гороскопы: дневные и недельные").add_line()
-
-        if limits.get("natal_chart"):
-            builder.add_text("• Натальная карта: ✅").add_line()
-
-        if limits.get("transits"):
-            builder.add_text("• Транзиты планет: ✅").add_line()
-
-        if limits.get("synastry"):
-            builder.add_text("• Анализ совместимости: ✅").add_line()
-
-        return builder.build()
-
-    async def _format_plans_comparison(self) -> str:
-        """Форматировать сравнение планов."""
-        text = (
-            "<b>Сравнение планов подписки</b>\n\n"
-            "<b>Функция | Free | Basic | Premium | VIP</b>\n"
-            "➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
-            "Карта дня | ✅ | ✅ | ✅ | ✅\n"
-            "Расклады/мес | 3 | 30 | ∞ | ∞\n"
-            "История | ❌ | ✅ | ✅ | ✅\n"
-            "Дневной гороскоп | ✅ | ✅ | ✅ | ✅\n"
-            "Недельный | ❌ | ✅ | ✅ | ✅\n"
-            "Месячный | ❌ | ❌ | ✅ | ✅\n"
-            "Годовой | ❌ | ❌ | ✅ | ✅\n"
-            "Натальная карта | ❌ | ❌ | ✅ | ✅\n"
-            "Транзиты | ❌ | ❌ | ✅ | ✅\n"
-            "Совместимость | ❌ | ❌ | ❌ | ✅\n"
-            "Личный астролог | ❌ | ❌ | ❌ | ✅\n"
-            "Поддержка | База | База | VIP | 24/7\n"
-            "➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
-            "<b>Цена | 0₽ | 299₽ | 599₽ | 999₽</b>"
-        )
+            text += (
+                "У вас нет активной подписки.\n\n"
+                "Оформите подписку для доступа к:\n"
+                "• Безлимитным раскладам Таро\n"
+                "• Персональным гороскопам\n"
+                "• Натальным картам\n"
+                "• Анализу совместимости\n"
+                "• И многому другому!\n\n"
+            )
 
         return text
 
-    async def _format_payment_summary(
-            self,
-            plan_name: str,
-            period: str,
-            total_price: float,
-            discount_amount: float,
-            final_price: float,
-            promo_code: Optional[str] = None,
-            promo_discount: float = 0
-    ) -> str:
-        """Форматировать сводку платежа."""
-        plan = self.SUBSCRIPTION_PLANS[plan_name]
-        period_names = {"1m": "1 месяц", "3m": "3 месяца", "12m": "12 месяцев"}
+    def _format_plan_details(self, plan_name: str, plan: Dict[str, Any]) -> str:
+        """Форматировать детали плана."""
+        text = f"💎 <b>План {plan['name']}</b>\n\n"
+        text += f"<b>Стоимость:</b> {plan['price']} ₽/месяц\n\n"
 
-        builder = MessageBuilder(MessageStyle.HTML)
+        text += "<b>Возможности:</b>\n"
+        for feature in plan['features']:
+            text += f"• {feature}\n"
 
-        builder.add_bold(f"{Emoji.CART} Оформление подписки").add_line(2)
+        text += "\n<b>Лимиты:</b>\n"
+        limits = plan['limits']
 
-        builder.add_text(f"<b>План:</b> {plan['name']}").add_line()
-        builder.add_text(f"<b>Период:</b> {period_names[period]}").add_line(2)
-
-        builder.add_text(f"Стоимость: {total_price:.0f} ₽").add_line()
-
-        if discount_amount > 0:
-            builder.add_text(f"Скидка за период: -{discount_amount:.0f} ₽").add_line()
-
-        if promo_code:
-            builder.add_text(
-                f"Промокод {promo_code}: -{promo_discount:.0f} ₽"
-            ).add_line()
-
-        builder.add_line()
-        builder.add_bold(f"Итого: {final_price:.0f} ₽").add_line(2)
-
-        builder.add_italic("Выберите способ оплаты:")
-
-        return builder.build()
-
-    async def _format_current_subscription(
-            self,
-            subscription,
-            usage_stats: Dict[str, Any]
-    ) -> str:
-        """Форматировать информацию о текущей подписке."""
-        plan = self.SUBSCRIPTION_PLANS[subscription.plan_name]
-        days_left = (subscription.end_date - datetime.utcnow()).days
-
-        builder = MessageBuilder(MessageStyle.HTML)
-
-        builder.add_bold(f"Ваша подписка {plan['name']}").add_line(2)
-
-        # Статус
-        builder.add_text(
-            f"<b>Активна до:</b> {subscription.end_date.strftime('%d.%m.%Y')}"
-        ).add_line()
-        builder.add_text(f"<b>Осталось дней:</b> {days_left}").add_line()
-
-        if subscription.auto_renew:
-            builder.add_text("✅ Автопродление включено").add_line()
+        if limits['tarot_spreads'] == -1:
+            text += "• Расклады Таро: Безлимит\n"
         else:
-            builder.add_text("❌ Автопродление выключено").add_line()
+            text += f"• Расклады Таро: {limits['tarot_spreads']}/месяц\n"
 
-        builder.add_line()
+        if limits.get('natal_chart'):
+            text += "• Натальная карта: ✅\n"
 
-        # Использование
-        builder.add_bold("Использование в этом месяце:").add_line()
+        if limits.get('transits'):
+            text += "• Транзиты планет: ✅\n"
 
-        if plan["limits"]["tarot_spreads"] == -1:
-            builder.add_text(
-                f"• Расклады Таро: {usage_stats.get('tarot_spreads', 0)}"
-            ).add_line()
+        if limits.get('synastry'):
+            text += "• Анализ совместимости: ✅\n"
+
+        return text
+
+    def _format_plans_comparison(self) -> str:
+        """Форматировать сравнение планов."""
+        text = "📊 <b>Сравнение тарифных планов</b>\n\n"
+
+        for plan_name, plan in self.SUBSCRIPTION_PLANS.items():
+            text += f"<b>{plan['name']} - {plan['price']} ₽/мес</b>\n"
+
+            # Основные функции
+            if plan['limits']['tarot_spreads'] == -1:
+                text += "✅ Безлимитные расклады\n"
+            else:
+                text += f"📊 {plan['limits']['tarot_spreads']} раскладов/мес\n"
+
+            if plan['limits'].get('natal_chart'):
+                text += "✅ Натальная карта\n"
+
+            if plan['limits'].get('transits'):
+                text += "✅ Транзиты планет\n"
+
+            if plan['limits'].get('synastry'):
+                text += "✅ Совместимость\n"
+
+            text += "\n"
+
+        return text
+
+    def _format_current_subscription(self, subscription: Any) -> str:
+        """Форматировать текущую подписку."""
+        plan = self.SUBSCRIPTION_PLANS.get(subscription.plan_name, {})
+
+        text = (
+            f"📋 <b>Ваша подписка</b>\n\n"
+            f"<b>План:</b> {plan.get('name', subscription.plan_name)}\n"
+            f"<b>Активна с:</b> {subscription.started_at.strftime('%d.%m.%Y')}\n"
+            f"<b>Действует до:</b> {subscription.expires_at.strftime('%d.%m.%Y')}\n"
+            f"<b>Автопродление:</b> {'✅ Включено' if subscription.auto_renew else '❌ Выключено'}\n\n"
+        )
+
+        # Дни до окончания
+        days_left = (subscription.expires_at - datetime.now()).days
+
+        if days_left <= 0:
+            text += "⚠️ <b>Подписка истекла!</b>\n"
+        elif days_left <= 7:
+            text += f"⚠️ <b>Осталось дней:</b> {days_left}\n"
         else:
-            used = usage_stats.get('tarot_spreads', 0)
-            limit = plan["limits"]["tarot_spreads"]
-            builder.add_text(f"• Расклады Таро: {used}/{limit}").add_line()
+            text += f"<b>Осталось дней:</b> {days_left}\n"
 
-        builder.add_text(
-            f"• Гороскопы: {usage_stats.get('horoscopes', 0)}"
-        ).add_line()
+        return text
 
-        if usage_stats.get('natal_charts'):
-            builder.add_text(
-                f"• Натальные карты: {usage_stats['natal_charts']}"
-            ).add_line()
-
-        return builder.build()
-
-    async def _format_payment_history(
-            self,
-            payments: List[Any]
-    ) -> str:
+    def _format_payment_history(self, payments: List[Any]) -> str:
         """Форматировать историю платежей."""
-        builder = MessageBuilder(MessageStyle.HTML)
+        text = "📜 <b>История платежей</b>\n\n"
 
-        builder.add_bold(f"{Emoji.HISTORY} История платежей").add_line(2)
+        for payment in payments[:10]:
+            text += (
+                f"📅 {payment.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+                f"💰 {payment.amount} {payment.currency}\n"
+                f"📋 {payment.description}\n"
+                f"✅ {payment.status}\n\n"
+            )
 
-        total_amount = sum(p.amount for p in payments)
+        return text
 
-        builder.add_text(
-            f"Всего платежей: {len(payments)} на сумму {total_amount:.0f} ₽"
-        ).add_line(2)
+    def _calculate_price(self, base_price: int, period: str) -> int:
+        """Рассчитать цену с учетом периода."""
+        if period == "1m":
+            return base_price
+        elif period == "3m":
+            return int(base_price * 3 * 0.9)  # Скидка 10%
+        elif period == "12m":
+            return int(base_price * 12 * 0.75)  # Скидка 25%
 
-        for payment in payments[:5]:  # Показываем последние 5
-            status_emoji = "✅" if payment.status == "completed" else "⏳"
+        return base_price
 
-            builder.add_text(
-                f"{status_emoji} {payment.created_at.strftime('%d.%m.%Y')} - "
-                f"{payment.amount:.0f} ₽ ({payment.plan_name})"
-            ).add_line()
-
-        if len(payments) > 5:
-            builder.add_line()
-            builder.add_italic("Показаны последние 5 платежей")
-
-        return builder.build()
-
-    async def _process_telegram_stars_payment(
-            self,
-            callback: CallbackQuery,
-            state: FSMContext
-    ) -> None:
-        """Обработать оплату через Telegram Stars."""
-        data = await state.get_data()
-
-        plan_name = data["selected_plan"]
-        period = data["payment_period"]
-        final_price = int(data["final_price"])
-
-        # Создаем инвойс
-        await callback.message.answer_invoice(
-            title=f"Подписка {self.SUBSCRIPTION_PLANS[plan_name]['name']}",
-            description=f"Оплата подписки на {period}",
-            payload=f"{plan_name}:{period}",
-            provider_token="",  # Для Stars не нужен
-            currency="XTR",  # Telegram Stars
-            prices=[
-                LabeledPrice(
-                    label=f"Подписка {self.SUBSCRIPTION_PLANS[plan_name]['name']}",
-                    amount=final_price
-                )
-            ],
-            start_parameter=f"subscribe_{plan_name}",
-            photo_url="https://example.com/subscription.jpg",  # Заменить на реальное фото
-            need_email=True,
-            send_email_to_provider=False
-        )
-
-        await callback.answer("Создан счет на оплату")
-
-    async def _process_yookassa_payment(
-            self,
-            callback: CallbackQuery,
-            state: FSMContext
-    ) -> None:
-        """Обработать оплату через ЮKassa."""
-        # Здесь должна быть интеграция с ЮKassa API
-        # Создание платежа, получение ссылки и т.д.
-
-        await callback.answer(
-            "Оплата через ЮKassa временно недоступна",
-            show_alert=True
-        )
-
-    async def _process_crypto_payment(
-            self,
-            callback: CallbackQuery,
-            state: FSMContext
-    ) -> None:
-        """Обработать оплату криптовалютой."""
-        # Здесь должна быть интеграция с крипто-процессингом
-
-        await callback.answer(
-            "Оплата криптовалютой временно недоступна",
-            show_alert=True
-        )
+    def _get_period_name(self, period: str) -> str:
+        """Получить название периода."""
+        period_names = {
+            "1m": "1 месяц",
+            "3m": "3 месяца",
+            "12m": "12 месяцев"
+        }
+        return period_names.get(period, period)
 
 
-def setup(router: Router) -> None:
-    """Настройка обработчиков подписки."""
-    handler = SubscriptionHandlers()
-    handler.register_handlers(router)
+# Функция для регистрации обработчика
+def register_subscription_handler(router: Router) -> None:
+    """
+    Регистрация обработчика подписки.
+
+    Args:
+        router: Роутер для регистрации
+    """
+    handler = SubscriptionHandlers(router)
+    handler.register_handlers()
+    logger.info("Subscription handler зарегистрирован")
+
+
+logger.info("Модуль обработчика подписки загружен")

@@ -106,6 +106,13 @@ class ConfirmCallbackData(CallbackData, prefix="confirm"):
     value: Optional[str] = None
 
 
+class RefreshCallbackData(CallbackData, prefix="refresh"):
+    """Callback data для обновления данных."""
+    action: str = "refresh"  # Действие по умолчанию
+    target: str  # Что обновлять (stats, system, etc.)
+    page: Optional[int] = None  # Страница для обновления (если есть пагинация)
+
+
 class BaseKeyboard(ABC):
     """Базовый абстрактный класс для всех клавиатур."""
 
@@ -182,6 +189,10 @@ class InlineKeyboard(BaseKeyboard):
                 url=config.url,
                 row_width=config.row_width
             )
+
+    def add_url_button(self, text: str, url: str) -> None:
+        """Добавить кнопку с URL."""
+        self.add_button(text=text, url=url)
 
 
 class ReplyKeyboard(BaseKeyboard):
@@ -538,6 +549,39 @@ def log_keyboard_creation(func: Callable) -> Callable:
             raise
 
     return wrapper
+
+
+# Экспорт всех компонентов
+__all__ = [
+    # Enum и dataclass
+    'ButtonStyle',
+    'ButtonConfig',
+
+    # Базовые классы
+    'BaseKeyboard',
+    'InlineKeyboard',
+    'ReplyKeyboard',
+
+    # Специализированные клавиатуры
+    'PaginatedKeyboard',
+    'DynamicMenu',
+    'ConfirmationKeyboard',
+
+    # Callback data классы
+    'BaseCallbackData',
+    'PaginationCallbackData',
+    'MenuCallbackData',
+    'ConfirmCallbackData',
+    'RefreshCallbackData',  # Добавлен экспорт
+
+    # Фабрика
+    'KeyboardFactory',
+
+    # Утилиты
+    'parse_callback_data',
+    'build_callback_data',
+    'log_keyboard_creation',
+]
 
 
 logger.info("Модуль базовых клавиатур загружен")

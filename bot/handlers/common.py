@@ -17,99 +17,126 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
+from bot.states import FeedbackStates
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, ErrorEvent
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
-from bot.handlers.base import BaseHandler
-from infrastructure.telegram import (
-    MessageFactory,
-    MessageBuilder,
-    MessageStyle,
-    MessageEmoji as Emoji,
-    MessageUtils
+from bot.handlers.base import (
+    BaseHandler,
+    error_handler,
+    log_action,
+    get_or_create_user,
+    answer_callback_query,
+    edit_or_send_message
 )
 from infrastructure import get_unit_of_work
+from config import settings
+
+# НОВЫЕ ИМПОРТЫ ДЛЯ КЛАВИАТУР
+from infrastructure.telegram.keyboards import (
+    InlineKeyboard,
+    Keyboards,
+    ConfirmationKeyboard,
+    BaseCallbackData,
+    ConfirmCallbackData,
+    RefreshCallbackData,
+    parse_callback_data
+)
 
 logger = logging.getLogger(__name__)
+
+
+# НОВЫЕ CALLBACK DATA
+class CommonCallbackData(BaseCallbackData, prefix="common"):
+    """Callback data для общих действий."""
+    target: Optional[str] = None  # Цель действия
+
+
+class FeedbackCallbackData(BaseCallbackData, prefix="feedback"):
+    """Callback data для обратной связи."""
+    rating: Optional[int] = None
+    category: Optional[str] = None
 
 
 class CommonHandler(BaseHandler):
     """Обработчик общих команд и событий."""
 
-    def register_handlers(self, router: Router) -> None:
+    def register_handlers(self) -> None:
         """Регистрация обработчиков."""
         # Команда отмены
-        router.message.register(
+        self.router.message.register(
             self.cmd_cancel,
             Command("cancel")
         )
 
         # Команда статистики
-        router.message.register(
+        self.router.message.register(
             self.cmd_stats,
             Command("stats")
         )
 
         # О боте
-        router.message.register(
+        self.router.message.register(
             self.cmd_about,
             Command("about")
         )
 
         # Команда обратной связи
-        router.message.register(
+        self.router.message.register(
             self.cmd_feedback,
             Command("feedback")
         )
 
         # Системная информация (для админов)
-        router.message.register(
+        self.router.message.register(
             self.cmd_system,
             Command("system")
         )
 
         # Обработка неизвестных команд
-        router.message.register(
+        self.router.message.register(
             self.unknown_command,
             Command()  # Любая команда
         )
 
         # Обработка обычных текстовых сообщений
-        router.message.register(
+        self.router.message.register(
             self.handle_text_message,
             F.text & ~F.text.startswith("/")
         )
 
-        # Общие callback кнопки
-        router.callback_query.register(
-            self.close_message,
-            F.data == "close"
+        # НОВЫЕ ОБРАБОТЧИКИ CALLBACK
+        self.router.callback_query.register(
+            self.close_message_handler,
+            CommonCallbackData.filter(F.action == "close")
         )
 
-        router.callback_query.register(
-            self.refresh_data,
-            F.data.startswith("refresh:")
+        self.router.callback_query.register(
+            self.refresh_data_handler,
+            RefreshCallbackData.filter()
         )
 
-        router.callback_query.register(
-            self.confirm_action,
-            F.data.startswith("confirm:")
+        self.router.callback_query.register(
+            self.confirm_action_handler,
+            ConfirmCallbackData.filter()
         )
 
-        router.callback_query.register(
-            self.cancel_action,
-            F.data.startswith("cancel:")
+        self.router.callback_query.register(
+            self.feedback_callback_handler,
+            FeedbackCallbackData.filter()
         )
 
-        # Обработка ошибок
-        router.error.register(
-            self.handle_error,
-            F.exception.as_("error")
+        # Старые callback для обратной совместимости
+        self.router.callback_query.register(
+            self.legacy_callback_handler,
+            F.data.in_(["close", "refresh:stats", "refresh:system"])
         )
 
+    @error_handler()
+    @log_action("cancel_command")
     async def cmd_cancel(
             self,
             message: Message,
@@ -122,253 +149,271 @@ class CommonHandler(BaseHandler):
 
         if current_state is None:
             await message.answer(
-                f"{Emoji.INFO} Нет активных действий для отмены.\n"
-                f"Используйте /menu для возврата в главное меню."
+                "❌ Нечего отменять.\n"
+                "Используйте /menu для главного меню."
             )
             return
 
         # Очищаем состояние
         await state.clear()
 
-        # Формируем сообщение об отмене
-        state_descriptions = {
-            "OnboardingStates": "процесс знакомства",
-            "TarotStates": "выбор карт",
-            "AstrologyStates": "ввод данных",
-            "PaymentStates": "процесс оплаты",
-            "FeedbackStates": "отправка отзыва"
-        }
-
-        # Определяем, что было отменено
-        state_group = current_state.split(":")[0] if ":" in current_state else "действие"
-        action_name = state_descriptions.get(state_group, "текущее действие")
+        # ИСПОЛЬЗУЕМ НОВУЮ КНОПКУ
+        keyboard = await Keyboards.menu_button()
 
         await message.answer(
-            f"{Emoji.CANCEL} <b>Отменено:</b> {action_name}\n\n"
-            f"Используйте /menu для возврата в главное меню.",
-            parse_mode="HTML"
+            "✅ Действие отменено.",
+            reply_markup=keyboard
         )
 
+        # Логируем отмену
+        await self.log_action(
+            message.from_user.id,
+            "action_cancelled",
+            {"previous_state": current_state}
+        )
+
+    @error_handler()
+    @log_action("stats_command")
     async def cmd_stats(
             self,
             message: Message,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Показать статистику пользователя."""
+        user_id = message.from_user.id
+
         async with get_unit_of_work() as uow:
-            user = await self.get_or_create_user(
-                uow,
-                message.from_user
-            )
+            user = await uow.users.get_by_telegram_id(user_id)
+
+            if not user:
+                await message.answer("❌ Пользователь не найден")
+                return
 
             # Получаем статистику
             tarot_stats = await uow.tarot.get_user_statistics(user.id)
             astro_stats = await uow.astrology.get_user_statistics(user.id)
 
             # Форматируем статистику
-            builder = MessageBuilder(MessageStyle.HTML)
+            text = self._format_user_stats(user, tarot_stats, astro_stats)
 
-            builder.add_bold(f"{Emoji.CHART} Ваша статистика").add_line(2)
-
-            # Общая информация
-            days_with_bot = (datetime.utcnow() - user.created_at).days
-            builder.add_text(f"<b>Дней с ботом:</b> {days_with_bot}").add_line()
-            builder.add_text(f"<b>Уровень подписки:</b> {user.subscription_plan.upper()}").add_line(2)
-
-            # Статистика Таро
-            if tarot_stats["total_spreads"] > 0:
-                builder.add_bold(f"{Emoji.CARDS} Таро:").add_line()
-                builder.add_text(f"• Раскладов выполнено: {tarot_stats['total_spreads']}").add_line()
-                builder.add_text(f"• Избранных раскладов: {tarot_stats['favorite_count']}").add_line()
-                builder.add_text(f"• Любимый расклад: {tarot_stats['favorite_spread']}").add_line()
-
-                # Топ карт
-                if tarot_stats.get("top_cards"):
-                    builder.add_line()
-                    builder.add_text("<b>Частые карты:</b>").add_line()
-                    for card, count in tarot_stats["top_cards"][:3]:
-                        builder.add_text(f"• {card}: {count} раз").add_line()
-
-                builder.add_line()
-
-            # Статистика астрологии
-            if astro_stats["total_horoscopes"] > 0:
-                builder.add_bold(f"{Emoji.STARS} Астрология:").add_line()
-                builder.add_text(f"• Гороскопов просмотрено: {astro_stats['total_horoscopes']}").add_line()
-                builder.add_text(f"• Натальных карт: {astro_stats['natal_charts']}").add_line()
-                builder.add_text(f"• Прогнозов транзитов: {astro_stats['transits']}").add_line(2)
-
-            # Достижения
-            achievements = await self._calculate_achievements(
-                user,
-                tarot_stats,
-                astro_stats
-            )
-
-            if achievements:
-                builder.add_bold(f"{Emoji.ACHIEVEMENT} Достижения:").add_line()
-                for achievement in achievements:
-                    builder.add_text(f"• {achievement}").add_line()
-                builder.add_line()
-
-            # Рекомендации
-            builder.add_italic(
-                self._get_stats_recommendation(
-                    tarot_stats["total_spreads"],
-                    astro_stats["total_horoscopes"]
+            # ИСПОЛЬЗУЕМ НОВУЮ КЛАВИАТУРУ
+            keyboard = InlineKeyboard()
+            keyboard.add_button(
+                text="🔄 Обновить",
+                callback_data=RefreshCallbackData(
+                    action="refresh",
+                    target="stats"
                 )
             )
+            keyboard.add_button(
+                text="📊 Подробная статистика",
+                callback_data=CommonCallbackData(
+                    action="detailed",
+                    value="stats",
+                    target=str(user.id)
+                )
+            )
+            keyboard.add_button(
+                text="❌ Закрыть",
+                callback_data=CommonCallbackData(action="close")
+            )
+
+            keyboard.builder.adjust(2, 1)
+            kb = await keyboard.build()
 
             await message.answer(
-                builder.build(),
+                text,
+                reply_markup=kb,
                 parse_mode="HTML"
             )
 
+    @error_handler()
+    @log_action("about_command")
     async def cmd_about(
             self,
             message: Message,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Информация о боте."""
-        about_text = MessageFactory.create(
-            "about_bot",
-            MessageStyle.HTML,
-            version="2.0",
-            year=datetime.now().year
+        text = (
+            "🤖 <b>Астро-Таро Бот</b>\n\n"
+            f"Версия: {settings.bot.version if hasattr(settings.bot, 'version') else '1.0.0'}\n"
+            f"Разработчик: AI Assistant\n\n"
+            "Ваш персональный помощник в мире эзотерики:\n"
+            "• 🎴 Расклады Таро\n"
+            "• 🔮 Натальные карты\n"
+            "• ⭐ Персональные гороскопы\n"
+            "• 🌙 Лунный календарь\n"
+            "• 💑 Анализ совместимости\n\n"
+            "Телеграм канал: @astrotaro_news\n"
+            "Поддержка: @astrotaro_support\n\n"
+            "С любовью к звездам и картам! ✨"
         )
 
-        # Добавляем статистику бота
-        async with get_unit_of_work() as uow:
-            total_users = await uow.users.count_total()
-            total_spreads = await uow.tarot.count_total_spreads()
+        # ИСПОЛЬЗУЕМ НОВУЮ КЛАВИАТУРУ
+        keyboard = InlineKeyboard()
+        keyboard.add_url_button("📢 Канал новостей", "https://t.me/astrotaro_news")
+        keyboard.add_url_button("💬 Поддержка", "https://t.me/astrotaro_support")
+        keyboard.add_button(
+            text="⭐ Оставить отзыв",
+            callback_data=FeedbackCallbackData(action="start")
+        )
+        keyboard.add_button(
+            text="❌ Закрыть",
+            callback_data=CommonCallbackData(action="close")
+        )
 
-            stats_text = (
-                f"\n\n<b>{Emoji.CHART} Статистика бота:</b>\n"
-                f"• Пользователей: {total_users:,}\n"
-                f"• Раскладов выполнено: {total_spreads:,}\n"
-                f"• Работает с: Январь 2024"
-            )
+        keyboard.builder.adjust(1, 1, 1, 1)
+        kb = await keyboard.build()
 
         await message.answer(
-            about_text + stats_text,
-            parse_mode="HTML",
-            disable_web_page_preview=True
+            text,
+            reply_markup=kb,
+            parse_mode="HTML"
         )
 
+    @error_handler()
     async def cmd_feedback(
             self,
             message: Message,
             state: FSMContext,
-            command: CommandObject,
             **kwargs
     ) -> None:
-        """Отправка обратной связи."""
-        # Если есть текст сразу после команды
-        if command.args:
-            await self._process_feedback(
-                message,
-                command.args,
-                message.from_user
+        """Команда обратной связи."""
+        text = (
+            "💬 <b>Обратная связь</b>\n\n"
+            "Мы ценим ваше мнение! Что вы хотите нам сообщить?"
+        )
+
+        # ИСПОЛЬЗУЕМ НОВУЮ КЛАВИАТУРУ ДЛЯ ВЫБОРА ТИПА ОБРАТНОЙ СВЯЗИ
+        keyboard = InlineKeyboard()
+
+        # Категории обратной связи
+        categories = [
+            ("💡", "Предложение", "suggestion"),
+            ("🐛", "Сообщить об ошибке", "bug"),
+            ("⭐", "Отзыв о боте", "review"),
+            ("❓", "Вопрос", "question"),
+            ("🤝", "Сотрудничество", "partnership")
+        ]
+
+        for emoji, text, category in categories:
+            keyboard.add_button(
+                text=f"{emoji} {text}",
+                callback_data=FeedbackCallbackData(
+                    action="category",
+                    category=category
+                )
             )
-        else:
-            # Запускаем состояние для сбора отзыва
-            from bot.states import FeedbackStates
 
-            await state.set_state(FeedbackStates.waiting_for_text)
+        keyboard.add_button(
+            text="❌ Отмена",
+            callback_data=CommonCallbackData(action="close")
+        )
 
-            await message.answer(
-                f"{Emoji.FEEDBACK} <b>Обратная связь</b>\n\n"
-                f"Напишите ваш отзыв, предложение или сообщение об ошибке.\n"
-                f"Мы обязательно рассмотрим его!\n\n"
-                f"<i>Отправьте /cancel для отмены</i>",
-                parse_mode="HTML"
-            )
+        keyboard.builder.adjust(1, 1, 1, 1, 1, 1)
+        kb = await keyboard.build()
 
+        await message.answer(
+            text,
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+
+    @error_handler()
     async def cmd_system(
             self,
             message: Message,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Системная информация (только для админов)."""
-        async with get_unit_of_work() as uow:
-            user = await uow.users.get_by_telegram_id(
-                message.from_user.id
+        if message.from_user.id not in settings.bot.admin_ids:
+            await self.unknown_command(message, state)
+            return
+
+        # Собираем системную информацию
+        text = await self._get_system_info()
+
+        # ИСПОЛЬЗУЕМ НОВУЮ КЛАВИАТУРУ
+        keyboard = InlineKeyboard()
+        keyboard.add_button(
+            text="🔄 Обновить",
+            callback_data=RefreshCallbackData(
+                action="refresh",
+                target="system"
             )
-
-            if not user or not user.is_admin:
-                await self.unknown_command(message)
-                return
-
-            # Собираем системную информацию
-            system_info = await self._collect_system_info(uow)
-
-            builder = MessageBuilder(MessageStyle.HTML)
-            builder.add_bold(f"{Emoji.ADMIN} Системная информация").add_line(2)
-
-            # Основные метрики
-            builder.add_bold("Пользователи:").add_line()
-            builder.add_text(f"• Всего: {system_info['users']['total']}").add_line()
-            builder.add_text(f"• Активных (24ч): {system_info['users']['active_24h']}").add_line()
-            builder.add_text(f"• Активных (7д): {system_info['users']['active_7d']}").add_line()
-            builder.add_text(f"• Новых сегодня: {system_info['users']['new_today']}").add_line(2)
-
-            # Подписки
-            builder.add_bold("Подписки:").add_line()
-            for plan, count in system_info['subscriptions'].items():
-                percentage = (count / system_info['users']['total']) * 100
-                builder.add_text(f"• {plan.upper()}: {count} ({percentage:.1f}%)").add_line()
-            builder.add_line()
-
-            # Активность
-            builder.add_bold("Активность (сегодня):").add_line()
-            builder.add_text(f"• Раскладов: {system_info['activity']['spreads_today']}").add_line()
-            builder.add_text(f"• Гороскопов: {system_info['activity']['horoscopes_today']}").add_line()
-            builder.add_text(f"• Платежей: {system_info['activity']['payments_today']}").add_line(2)
-
-            # Система
-            builder.add_bold("Система:").add_line()
-            builder.add_text(f"• Версия: 2.0").add_line()
-            builder.add_text(f"• Uptime: {system_info['system']['uptime']}").add_line()
-            builder.add_text(f"• База данных: {system_info['system']['db_size']} MB").add_line()
-            builder.add_text(f"• Кэш: {system_info['system']['cache_hits']}% hits").add_line()
-
-            await message.answer(
-                builder.build(),
-                parse_mode="HTML"
+        )
+        keyboard.add_button(
+            text="📊 Детальная статистика",
+            callback_data=CommonCallbackData(
+                action="admin",
+                value="detailed_stats"
             )
+        )
+        keyboard.add_button(
+            text="🔧 Управление",
+            callback_data=CommonCallbackData(
+                action="admin",
+                value="management"
+            )
+        )
+        keyboard.add_button(
+            text="❌ Закрыть",
+            callback_data=CommonCallbackData(action="close")
+        )
 
+        keyboard.builder.adjust(1, 2, 1)
+        kb = await keyboard.build()
+
+        await message.answer(
+            text,
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+
+    @error_handler()
     async def unknown_command(
             self,
             message: Message,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Обработка неизвестных команд."""
-        # Список известных команд
-        known_commands = [
-            "/start", "/help", "/menu", "/cancel",
-            "/stats", "/about", "/feedback", "/support",
-            "/tarot", "/astrology", "/subscription"
-        ]
+        command = message.text.split()[0] if message.text else ""
 
-        # Пытаемся найти похожую команду
-        command = message.text.split()[0].lower()
-        suggestions = self._find_similar_commands(command, known_commands)
+        # Пытаемся найти похожие команды
+        suggestions = self._find_similar_commands(command)
 
-        response = f"{Emoji.CONFUSED} Неизвестная команда: {command}\n\n"
+        text = f"❓ Неизвестная команда: {command}\n\n"
 
         if suggestions:
-            response += f"Возможно, вы имели в виду:\n"
-            for suggestion in suggestions[:3]:
-                response += f"• {suggestion}\n"
-            response += "\n"
+            text += "Возможно, вы имели в виду:\n"
+            for cmd in suggestions[:3]:
+                text += f"• {cmd}\n"
+            text += "\n"
 
-        response += (
-            f"Используйте /help для просмотра доступных команд\n"
-            f"или /menu для главного меню."
+        text += "Используйте /help для списка доступных команд."
+
+        # ИСПОЛЬЗУЕМ НОВЫЕ КНОПКИ
+        keyboard = InlineKeyboard()
+        keyboard.add_button(
+            text="📚 Справка",
+            callback_data="help:menu"
+        )
+        keyboard.add_button(
+            text="📋 Главное меню",
+            callback_data="main_menu"
         )
 
-        await message.answer(response)
+        keyboard.builder.adjust(2)
+        kb = await keyboard.build()
 
+        await message.answer(text, reply_markup=kb)
+
+    @error_handler()
     async def handle_text_message(
             self,
             message: Message,
@@ -382,350 +427,512 @@ class CommonHandler(BaseHandler):
         if current_state:
             return
 
-        # Анализируем сообщение
+        # Анализируем текст сообщения
         text_lower = message.text.lower()
 
         # Простые ответы на частые фразы
-        responses = {
-            "привет": self._greeting_response,
-            "спасибо": self._thanks_response,
-            "помощь": self._help_hint,
-            "таро": self._tarot_hint,
-            "гороскоп": self._horoscope_hint,
-            "подписка": self._subscription_hint
-        }
+        if any(word in text_lower for word in ["привет", "здравствуй", "добрый день", "hi", "hello"]):
+            await message.answer(self._greeting_response())
+        elif any(word in text_lower for word in ["спасибо", "благодарю", "thanks"]):
+            await message.answer(self._thanks_response())
+        elif any(word in text_lower for word in ["помощь", "помоги", "help"]):
+            await self._send_help_hint(message)
+        elif any(word in text_lower for word in ["таро", "карты", "расклад"]):
+            await self._send_tarot_hint(message)
+        elif any(word in text_lower for word in ["гороскоп", "астрология", "натальн"]):
+            await self._send_horoscope_hint(message)
+        elif any(word in text_lower for word in ["подписка", "premium", "премиум"]):
+            await self._send_subscription_hint(message)
+        else:
+            # Общий ответ с кнопками
+            await self._send_default_response(message)
 
-        for keyword, response_func in responses.items():
-            if keyword in text_lower:
-                await message.answer(
-                    response_func(),
-                    parse_mode="HTML"
-                )
-                return
+    # НОВЫЕ ОБРАБОТЧИКИ CALLBACK
 
-        # Если ничего не подошло
-        await message.answer(
-            f"{Emoji.THINKING} Я не совсем понял ваш запрос.\n\n"
-            f"Попробуйте:\n"
-            f"• /menu - главное меню\n"
-            f"• /help - справка по командам\n"
-            f"• /tarot - расклады Таро\n"
-            f"• /astrology - астрология"
-        )
-
-    async def close_message(
+    @error_handler()
+    async def close_message_handler(
             self,
             callback: CallbackQuery,
+            callback_data: CommonCallbackData,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Закрыть/удалить сообщение."""
-        await self.delete_message_safe(callback.message)
-        await callback.answer("Закрыто")
-
-    async def refresh_data(
-            self,
-            callback: CallbackQuery,
-            **kwargs
-    ) -> None:
-        """Обновить данные в сообщении."""
-        # Извлекаем тип данных для обновления
-        data_type = callback.data.split(":")[1]
-
-        # Здесь должна быть логика обновления в зависимости от типа
-        # Пока просто показываем уведомление
-        await callback.answer(
-            f"{Emoji.REFRESH} Данные обновлены",
-            show_alert=False
-        )
-
-    async def confirm_action(
-            self,
-            callback: CallbackQuery,
-            state: FSMContext,
-            **kwargs
-    ) -> None:
-        """Подтверждение действия."""
-        # Извлекаем действие и параметры
-        parts = callback.data.split(":")
-        action = parts[1]
-        params = parts[2] if len(parts) > 2 else None
-
-        # Обрабатываем в зависимости от действия
-        await callback.answer(
-            f"{Emoji.CHECK} Подтверждено",
-            show_alert=False
-        )
-
-        # Здесь должна быть логика выполнения подтвержденного действия
-
-    async def cancel_action(
-            self,
-            callback: CallbackQuery,
-            state: FSMContext,
-            **kwargs
-    ) -> None:
-        """Отмена действия."""
-        await state.clear()
-        await self.delete_message_safe(callback.message)
-        await callback.answer(
-            f"{Emoji.CANCEL} Отменено",
-            show_alert=False
-        )
-
-    async def handle_error(
-            self,
-            event: ErrorEvent,
-            **kwargs
-    ) -> None:
-        """Обработка ошибок."""
-        logger.error(
-            f"Error in handler: {event.exception}",
-            exc_info=event.exception
-        )
-
-        # Пытаемся отправить сообщение пользователю
-        if hasattr(event.update, "message") and event.update.message:
-            user_message = event.update.message
-        elif hasattr(event.update, "callback_query") and event.update.callback_query:
-            user_message = event.update.callback_query.message
-        else:
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            await answer_callback_query(
+                callback,
+                "Не удалось удалить сообщение",
+                show_alert=True
+            )
             return
 
-        try:
-            error_text = MessageFactory.create(
-                "error_occurred",
-                MessageStyle.HTML
-            )
+        await answer_callback_query(callback, "Закрыто")
 
-            await user_message.answer(error_text, parse_mode="HTML")
-        except Exception as e:
-            logger.error(f"Failed to send error message: {e}")
+    @error_handler()
+    async def refresh_data_handler(
+            self,
+            callback: CallbackQuery,
+            callback_data: RefreshCallbackData,
+            state: FSMContext,
+            **kwargs
+    ) -> None:
+        """Обновить данные."""
+        target = callback_data.target
+
+        if target == "stats":
+            # Обновляем статистику
+            await self.cmd_stats(callback.message, state)
+        elif target == "system":
+            # Обновляем системную информацию
+            await self.cmd_system(callback.message, state)
+
+        await answer_callback_query(callback, "Данные обновлены")
+
+    @error_handler()
+    async def confirm_action_handler(
+            self,
+            callback: CallbackQuery,
+            callback_data: ConfirmCallbackData,
+            state: FSMContext,
+            **kwargs
+    ) -> None:
+        """Обработка подтверждения действия."""
+        if callback_data.confirmed:
+            action = callback_data.action_id
+            # Здесь обрабатываем различные подтверждения
+            await answer_callback_query(
+                callback,
+                f"✅ Действие подтверждено",
+                show_alert=True
+            )
+        else:
+            await edit_or_send_message(
+                callback.message,
+                "❌ Действие отменено",
+                reply_markup=None
+            )
+            await answer_callback_query(callback)
+
+    @error_handler()
+    async def feedback_callback_handler(
+            self,
+            callback: CallbackQuery,
+            callback_data: FeedbackCallbackData,
+            state: FSMContext,
+            **kwargs
+    ) -> None:
+        """Обработчик callback для обратной связи."""
+        action = callback_data.action
+
+        if action == "start":
+            # Показываем категории
+            await self._show_feedback_categories(callback)
+        elif action == "category":
+            # Выбрана категория
+            category = callback_data.category
+            await self._start_feedback_collection(callback, category, state)
+        elif action == "rating":
+            # Оценка бота
+            rating = callback_data.rating
+            await self._save_rating(callback, rating)
+
+        await answer_callback_query(callback)
+
+    # Обработчик для старых callback (обратная совместимость)
+    @error_handler()
+    async def legacy_callback_handler(
+            self,
+            callback: CallbackQuery,
+            state: FSMContext,
+            **kwargs
+    ) -> None:
+        """Обработка старых callback для обратной совместимости."""
+        data = callback.data
+
+        if data == "close":
+            await self.close_message_handler(
+                callback,
+                CommonCallbackData(action="close"),
+                state,
+                **kwargs
+            )
+        elif data.startswith("refresh:"):
+            target = data.split(":")[1]
+            await self.refresh_data_handler(
+                callback,
+                RefreshCallbackData(action="refresh", target=target),
+                state,
+                **kwargs
+            )
 
     # Вспомогательные методы
 
-    async def _process_feedback(
+    def _format_user_stats(
             self,
-            message: Message,
-            feedback_text: str,
-            user
-    ) -> None:
-        """Обработать отзыв."""
-        async with get_unit_of_work() as uow:
-            # Сохраняем отзыв в БД
-            await uow.feedback.create(
-                user_id=user.id,
-                text=feedback_text,
-                type="feedback"
-            )
-            await uow.commit()
-
-        # Отправляем админам
-        await self._notify_admins_about_feedback(
-            user,
-            feedback_text
-        )
-
-        await message.answer(
-            f"{Emoji.CHECK} <b>Спасибо за отзыв!</b>\n\n"
-            f"Мы обязательно рассмотрим ваше сообщение "
-            f"и учтем его в развитии бота.",
-            parse_mode="HTML"
-        )
-
-    async def _calculate_achievements(
-            self,
-            user,
+            user: Any,
             tarot_stats: Dict[str, Any],
             astro_stats: Dict[str, Any]
-    ) -> list:
-        """Рассчитать достижения пользователя."""
-        achievements = []
-
-        # Достижения по количеству раскладов
-        spreads = tarot_stats["total_spreads"]
-        if spreads >= 100:
-            achievements.append(f"{Emoji.ACHIEVEMENT} Мастер Таро (100+ раскладов)")
-        elif spreads >= 50:
-            achievements.append(f"{Emoji.ACHIEVEMENT} Знаток карт (50+ раскладов)")
-        elif spreads >= 10:
-            achievements.append(f"{Emoji.ACHIEVEMENT} Искатель истины (10+ раскладов)")
-
-        # Достижения по времени
-        days_with_bot = (datetime.utcnow() - user.created_at).days
-        if days_with_bot >= 365:
-            achievements.append(f"{Emoji.ACHIEVEMENT} Годовщина (365+ дней)")
-        elif days_with_bot >= 30:
-            achievements.append(f"{Emoji.ACHIEVEMENT} Постоянный клиент (30+ дней)")
-
-        # Достижения по подписке
-        if user.subscription_plan == "vip":
-            achievements.append(f"{Emoji.CROWN} VIP статус")
-        elif user.subscription_plan == "premium":
-            achievements.append(f"{Emoji.STAR} Premium подписчик")
-
-        return achievements
-
-    def _get_stats_recommendation(
-            self,
-            tarot_count: int,
-            astro_count: int
     ) -> str:
-        """Получить рекомендацию на основе статистики."""
-        total = tarot_count + astro_count
+        """Форматировать статистику пользователя."""
+        text = f"📊 <b>Ваша статистика</b>\n\n"
 
-        if total == 0:
-            return (
-                "Начните свое путешествие в мир Таро и астрологии! "
-                "Попробуйте расклад 'Карта дня' или дневной гороскоп."
-            )
-        elif total < 10:
-            return (
-                "Вы делаете первые шаги в познании себя. "
-                "Исследуйте различные расклады и не забывайте о натальной карте!"
-            )
-        elif tarot_count > astro_count * 2:
-            return (
-                "Вы истинный ценитель Таро! "
-                "Попробуйте также изучить вашу натальную карту для полной картины."
-            )
-        elif astro_count > tarot_count * 2:
-            return (
-                "Звезды - ваши верные спутники! "
-                "Дополните астрологические знания мудростью карт Таро."
-            )
-        else:
-            return (
-                "Отличный баланс между Таро и астрологией! "
-                "Продолжайте исследовать оба направления для глубокого самопознания."
-            )
+        # Общая информация
+        text += f"<b>👤 Профиль:</b>\n"
+        text += f"• Имя: {user.display_name or user.first_name or 'Не указано'}\n"
+        text += f"• Дата регистрации: {user.created_at.strftime('%d.%m.%Y') if hasattr(user, 'created_at') else 'Неизвестно'}\n"
 
-    async def _collect_system_info(self, uow) -> Dict[str, Any]:
-        """Собрать системную информацию."""
-        now = datetime.utcnow()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Подписка
+        if hasattr(user, 'subscription_plan') and user.subscription_plan:
+            text += f"• Подписка: {user.subscription_plan.upper()}\n"
 
-        # Пользователи
-        total_users = await uow.users.count_total()
-        active_24h = await uow.users.count_active(days=1)
-        active_7d = await uow.users.count_active(days=7)
-        new_today = await uow.users.count_registered_after(today_start)
+        text += "\n"
 
-        # Подписки
-        subscriptions = await uow.subscriptions.count_by_plan()
+        # Статистика Таро
+        if tarot_stats:
+            text += f"<b>🎴 Таро:</b>\n"
+            text += f"• Раскладов выполнено: {tarot_stats.get('total_spreads', 0)}\n"
+            text += f"• Карт вытянуто: {tarot_stats.get('total_cards', 0)}\n"
 
-        # Активность
-        spreads_today = await uow.tarot.count_spreads_after(today_start)
-        horoscopes_today = await uow.astrology.count_horoscopes_after(today_start)
-        payments_today = await uow.payments.count_after(today_start)
+            if tarot_stats.get('favorite_card'):
+                text += f"• Любимая карта: {tarot_stats['favorite_card']}\n"
 
-        # Система
-        # Здесь должны быть реальные метрики
-        uptime = "14d 7h 23m"
-        db_size = 156.7
-        cache_hits = 87.3
+            text += "\n"
 
-        return {
-            "users": {
-                "total": total_users,
-                "active_24h": active_24h,
-                "active_7d": active_7d,
-                "new_today": new_today
-            },
-            "subscriptions": subscriptions,
-            "activity": {
-                "spreads_today": spreads_today,
-                "horoscopes_today": horoscopes_today,
-                "payments_today": payments_today
-            },
-            "system": {
-                "uptime": uptime,
-                "db_size": db_size,
-                "cache_hits": cache_hits
-            }
-        }
+        # Статистика Астрологии
+        if astro_stats:
+            text += f"<b>🔮 Астрология:</b>\n"
+            text += f"• Гороскопов просмотрено: {astro_stats.get('total_horoscopes', 0)}\n"
+            text += f"• Натальных карт: {astro_stats.get('natal_charts', 0)}\n"
+            text += f"• Проверок совместимости: {astro_stats.get('synastry_checks', 0)}\n"
+            text += "\n"
 
-    def _find_similar_commands(
-            self,
-            command: str,
-            known_commands: list
-    ) -> list:
+        # Достижения
+        total_actions = (
+            tarot_stats.get('total_spreads', 0) +
+            astro_stats.get('total_horoscopes', 0)
+        )
+
+        if total_actions > 0:
+            text += f"<b>🏆 Достижения:</b>\n"
+
+            if total_actions >= 100:
+                text += "• 💫 Мастер эзотерики (100+ действий)\n"
+            elif total_actions >= 50:
+                text += "• ⭐ Продвинутый искатель (50+ действий)\n"
+            elif total_actions >= 10:
+                text += "• 🌟 Начинающий мистик (10+ действий)\n"
+            else:
+                text += "• ✨ Новичок\n"
+
+        return text
+
+    async def _get_system_info(self) -> str:
+        """Получить системную информацию."""
+        async with get_unit_of_work() as uow:
+            # Статистика пользователей
+            total_users = await uow.users.count_total()
+            active_today = await uow.users.count_active(days=1)
+            active_week = await uow.users.count_active(days=7)
+
+            # Статистика подписок
+            subscriptions = await uow.subscriptions.count_by_plan()
+
+            # Статистика использования
+            tarot_today = await uow.tarot.count_spreads_today()
+            horoscopes_today = await uow.astrology.count_horoscopes_today()
+
+        text = (
+            "🖥 <b>Системная информация</b>\n\n"
+            f"<b>👥 Пользователи:</b>\n"
+            f"• Всего: {total_users}\n"
+            f"• Активных сегодня: {active_today}\n"
+            f"• Активных за неделю: {active_week}\n\n"
+            f"<b>💎 Подписки:</b>\n"
+        )
+
+        for plan, count in subscriptions.items():
+            text += f"• {plan.upper()}: {count}\n"
+
+        text += (
+            f"\n<b>📊 Активность сегодня:</b>\n"
+            f"• Раскладов Таро: {tarot_today}\n"
+            f"• Гороскопов: {horoscopes_today}\n\n"
+            f"<b>🔧 Система:</b>\n"
+            f"• Версия бота: {settings.bot.version if hasattr(settings.bot, 'version') else '1.0.0'}\n"
+            f"• Окружение: {settings.environment}\n"
+            f"• Время работы: {self._get_uptime()}"
+        )
+
+        return text
+
+    def _get_uptime(self) -> str:
+        """Получить время работы бота."""
+        # Здесь должна быть логика получения uptime
+        # Пока возвращаем заглушку
+        return "Неизвестно"
+
+    def _find_similar_commands(self, command: str) -> list:
         """Найти похожие команды."""
+        known_commands = [
+            "/start", "/help", "/menu", "/tarot", "/astrology",
+            "/subscription", "/profile", "/settings", "/stats",
+            "/about", "/support", "/cancel"
+        ]
+
+        # Убираем слэш для сравнения
+        command = command.lstrip("/")
+
         # Простой алгоритм на основе начала строки
         suggestions = []
 
         for known in known_commands:
-            if known.startswith(command[:3]):
+            known_clean = known.lstrip("/")
+            if known_clean.startswith(command[:3]):
                 suggestions.append(known)
-            elif command[1:] in known:
+            elif command in known_clean:
                 suggestions.append(known)
 
-        return suggestions
-
-    async def _notify_admins_about_feedback(
-            self,
-            user,
-            feedback_text: str
-    ) -> None:
-        """Уведомить админов о новом отзыве."""
-        # Здесь должна быть отправка уведомлений админам
-        # Например, через отдельный канал или личные сообщения
-        pass
+        return suggestions[:3]  # Максимум 3 предложения
 
     # Функции для генерации ответов
 
     def _greeting_response(self) -> str:
         """Ответ на приветствие."""
         return (
-            f"{Emoji.WAVE} Привет! Рад вас видеть!\n\n"
-            f"Используйте /menu для главного меню "
-            f"или /help если нужна помощь."
+            "👋 Привет! Рад вас видеть!\n\n"
+            "Используйте /menu для главного меню "
+            "или /help если нужна помощь."
         )
 
     def _thanks_response(self) -> str:
         """Ответ на благодарность."""
         return (
-            f"{Emoji.HEART} Всегда пожалуйста! "
-            f"Рад быть полезным!"
+            "💖 Всегда пожалуйста! "
+            "Рад быть полезным!"
         )
 
-    def _help_hint(self) -> str:
-        """Подсказка о помощи."""
-        return (
-            f"{Emoji.INFO} Нужна помощь?\n\n"
-            f"• /help - полная справка\n"
-            f"• /support - связь с поддержкой\n"
-            f"• /menu - главное меню"
+    async def _send_help_hint(self, message: Message) -> None:
+        """Подсказка о помощи с кнопками."""
+        text = (
+            "ℹ️ Нужна помощь?\n\n"
+            "Выберите, что вас интересует:"
         )
 
-    def _tarot_hint(self) -> str:
-        """Подсказка о Таро."""
-        return (
-            f"{Emoji.CARDS} Интересуетесь Таро?\n\n"
-            f"• /tarot - перейти к раскладам\n"
-            f"• /menu → Таро - через главное меню\n\n"
-            f"Попробуйте расклад 'Карта дня' для начала!"
+        keyboard = InlineKeyboard()
+        keyboard.add_button(text="📚 Полная справка", callback_data="help:menu")
+        keyboard.add_button(text="💬 Связь с поддержкой", callback_data="help:support")
+        keyboard.add_button(text="📋 Главное меню", callback_data="main_menu")
+
+        keyboard.builder.adjust(1, 1, 1)
+        kb = await keyboard.build()
+
+        await message.answer(text, reply_markup=kb)
+
+    async def _send_tarot_hint(self, message: Message) -> None:
+        """Подсказка о Таро с кнопками."""
+        text = (
+            "🎴 Интересуетесь Таро?\n\n"
+            "Попробуйте популярные расклады:"
         )
 
-    def _horoscope_hint(self) -> str:
-        """Подсказка о гороскопе."""
-        return (
-            f"{Emoji.STARS} Хотите узнать гороскоп?\n\n"
-            f"• /astrology - раздел астрологии\n"
-            f"• /menu → Астрология - через меню\n\n"
-            f"Доступны дневные, недельные и личные гороскопы!"
+        from infrastructure.telegram.keyboards import TarotCallbackData
+
+        keyboard = InlineKeyboard()
+        keyboard.add_button(
+            text="🎴 Карта дня",
+            callback_data=TarotCallbackData(action="daily_card")
+        )
+        keyboard.add_button(
+            text="🔮 Быстрый расклад",
+            callback_data=TarotCallbackData(action="quick_spread")
+        )
+        keyboard.add_button(
+            text="📋 Все расклады",
+            callback_data=TarotCallbackData(action="menu")
         )
 
-    def _subscription_hint(self) -> str:
-        """Подсказка о подписке."""
-        return (
-            f"{Emoji.PAYMENT} Интересует подписка?\n\n"
-            f"• /subscription - управление подпиской\n"
-            f"• /menu → Подписка - через меню\n\n"
-            f"Откройте больше возможностей с Premium!"
+        keyboard.builder.adjust(1, 1, 1)
+        kb = await keyboard.build()
+
+        await message.answer(text, reply_markup=kb)
+
+    async def _send_horoscope_hint(self, message: Message) -> None:
+        """Подсказка о гороскопе с кнопками."""
+        text = (
+            "⭐ Хотите узнать гороскоп?\n\n"
+            "Доступные варианты:"
+        )
+
+        from infrastructure.telegram.keyboards import AstrologyCallbackData
+
+        keyboard = InlineKeyboard()
+        keyboard.add_button(
+            text="☀️ Гороскоп на сегодня",
+            callback_data=AstrologyCallbackData(action="daily_horoscope")
+        )
+        keyboard.add_button(
+            text="🗓 На неделю",
+            callback_data=AstrologyCallbackData(action="weekly_horoscope")
+        )
+        keyboard.add_button(
+            text="🔮 Все функции астрологии",
+            callback_data=AstrologyCallbackData(action="menu")
+        )
+
+        keyboard.builder.adjust(1, 1, 1)
+        kb = await keyboard.build()
+
+        await message.answer(text, reply_markup=kb)
+
+    async def _send_subscription_hint(self, message: Message) -> None:
+        """Подсказка о подписке с кнопками."""
+        text = (
+            "💎 Интересует подписка?\n\n"
+            "Откройте больше возможностей:"
+        )
+
+        from infrastructure.telegram.keyboards import SubscriptionCallbackData
+
+        keyboard = InlineKeyboard()
+        keyboard.add_button(
+            text="📋 Тарифные планы",
+            callback_data=SubscriptionCallbackData(action="plans")
+        )
+        keyboard.add_button(
+            text="🎁 Промокод",
+            callback_data=SubscriptionCallbackData(action="promo")
+        )
+        keyboard.add_button(
+            text="💳 Оформить подписку",
+            callback_data=SubscriptionCallbackData(action="subscribe")
+        )
+
+        keyboard.builder.adjust(1, 1, 1)
+        kb = await keyboard.build()
+
+        await message.answer(text, reply_markup=kb)
+
+    async def _send_default_response(self, message: Message) -> None:
+        """Стандартный ответ с кнопками навигации."""
+        text = (
+            "🤔 Не совсем понимаю, что вы имеете в виду.\n\n"
+            "Выберите нужный раздел:"
+        )
+
+        keyboard = InlineKeyboard()
+        keyboard.add_button(text="📋 Главное меню", callback_data="main_menu")
+        keyboard.add_button(text="🎴 Таро", callback_data="menu:tarot")
+        keyboard.add_button(text="🔮 Астрология", callback_data="menu:astrology")
+        keyboard.add_button(text="📚 Справка", callback_data="help:menu")
+
+        keyboard.builder.adjust(2, 2)
+        kb = await keyboard.build()
+
+        await message.answer(text, reply_markup=kb)
+
+    async def _show_feedback_categories(self, callback: CallbackQuery) -> None:
+        """Показать категории обратной связи."""
+        text = (
+            "💬 <b>Обратная связь</b>\n\n"
+            "Выберите тип сообщения:"
+        )
+
+        keyboard = InlineKeyboard()
+
+        categories = [
+            ("💡", "Предложение", "suggestion"),
+            ("🐛", "Сообщить об ошибке", "bug"),
+            ("⭐", "Отзыв о боте", "review"),
+            ("❓", "Вопрос", "question"),
+            ("🤝", "Сотрудничество", "partnership")
+        ]
+
+        for emoji, text_btn, category in categories:
+            keyboard.add_button(
+                text=f"{emoji} {text_btn}",
+                callback_data=FeedbackCallbackData(
+                    action="category",
+                    category=category
+                )
+            )
+
+        keyboard.add_button(
+            text="❌ Отмена",
+            callback_data=CommonCallbackData(action="close")
+        )
+
+        keyboard.builder.adjust(1, 1, 1, 1, 1, 1)
+        kb = await keyboard.build()
+
+        await edit_or_send_message(
+            callback.message,
+            text,
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+
+    async def _start_feedback_collection(
+            self,
+            callback: CallbackQuery,
+            category: str,
+            state: FSMContext
+    ) -> None:
+        """Начать сбор обратной связи."""
+        category_names = {
+            "suggestion": "предложение",
+            "bug": "сообщение об ошибке",
+            "review": "отзыв",
+            "question": "вопрос",
+            "partnership": "предложение о сотрудничестве"
+        }
+
+        text = (
+            f"✍️ Отлично! Напишите ваше {category_names.get(category, 'сообщение')}.\n\n"
+            "Просто отправьте текст в ответ на это сообщение."
+        )
+
+        keyboard = await Keyboards.cancel()
+
+        await edit_or_send_message(
+            callback.message,
+            text,
+            reply_markup=keyboard
+        )
+
+        # Сохраняем категорию и устанавливаем состояние
+        await state.update_data(feedback_category=category)
+        await state.set_state(FeedbackStates.waiting_for_text)
+
+    async def _save_rating(self, callback: CallbackQuery, rating: int) -> None:
+        """Сохранить оценку бота."""
+        # Здесь логика сохранения оценки
+        text = (
+            f"Спасибо за вашу оценку: {'⭐' * rating}\n\n"
+            "Ваше мнение очень важно для нас!"
+        )
+
+        keyboard = await Keyboards.close()
+
+        await edit_or_send_message(
+            callback.message,
+            text,
+            reply_markup=keyboard
         )
 
 
-def setup(router: Router) -> None:
-    """Настройка обработчиков общих команд."""
-    handler = CommonHandler()
-    handler.register_handlers(router)
+# Функция для регистрации обработчика
+def register_common_handler(router: Router) -> None:
+    """
+    Регистрация обработчика общих команд.
+
+    Args:
+        router: Роутер для регистрации
+    """
+    handler = CommonHandler(router)
+    handler.register_handlers()
+    logger.info("Common handler зарегистрирован")
+
+
+logger.info("Модуль обработчика общих команд загружен")

@@ -17,7 +17,8 @@ import logging
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, Optional, List
 import asyncio
-from zoneinfo import ZoneInfo
+import re
+import math
 
 from aiogram import Router, F
 from aiogram.filters import Command, StateFilter
@@ -25,24 +26,29 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
-from bot.handlers.base import BaseHandler, require_subscription, error_handler
+from bot.handlers.base import (
+    BaseHandler,
+    require_subscription,
+    error_handler,
+    log_action,
+    get_or_create_user,
+    answer_callback_query,
+    edit_or_send_message
+)
 from bot.states import AstrologyStates
-from infrastructure.telegram import (
+from infrastructure.telegram.keyboards import (
     Keyboards,
-    MessageFactory,
-    HoroscopeMessage,
-    NatalChartMessage,
-    TransitMessage,
-    MoonPhaseMessage,
-    SynastryMessage,
-    MessageBuilder,
-    MessageStyle,
-    MessageEmoji as Emoji,
-    ZodiacSign,
+    InlineKeyboard,
+    AstrologyCallbackData,
+    BirthDataCallbackData,
+    ChartCallbackData,
+    TransitCallbackData,
+    CalendarCallbackData,
     HoroscopeType
 )
 from infrastructure import get_unit_of_work
-from infrastructure.external_apis import get_llm_manager
+from services import get_astrology_service
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -66,120 +72,122 @@ class AstrologyHandlers(BaseHandler):
         "pisces": (2, 19, 3, 20)
     }
 
-    def register_handlers(self, router: Router) -> None:
+    def register_handlers(self) -> None:
         """Регистрация обработчиков астрологии."""
         # Команда /astrology
-        router.message.register(
+        self.router.message.register(
             self.cmd_astrology,
             Command("astrology")
         )
 
         # Главное меню астрологии
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.show_astrology_menu,
             F.data == "astrology_menu"
         )
 
         # Гороскопы
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.show_horoscope_menu,
             F.data == "horoscope_menu"
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.select_horoscope_type,
             F.data.startswith("horoscope_type:")
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.select_zodiac_sign,
             F.data.startswith("zodiac_select:")
         )
 
+        self.router.callback_query.register(
+            self.horoscope_daily,
+            F.data == "horoscope_daily"
+        )
+
         # Натальная карта
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.show_natal_chart,
             F.data == "natal_chart"
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.natal_chart_settings,
             F.data == "natal_settings"
         )
 
         # Транзиты
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.show_transits_menu,
             F.data == "transits_menu"
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.select_transit_period,
             F.data.startswith("transit_period:")
         )
 
         # Синастрия
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.start_synastry,
-            F.data == "synastry_start"
-        )
-
-        router.callback_query.register(
-            self.synastry_result,
-            F.data.startswith("synastry_result:")
+            F.data == "synastry"
         )
 
         # Лунный календарь
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.show_lunar_calendar,
-            F.data == "lunar_calendar"
+            F.data == "moon_calendar"
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.lunar_day_details,
             F.data.startswith("lunar_day:")
         )
 
         # Данные рождения
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.start_birth_data_input,
             F.data == "input_birth_data"
         )
 
-        router.callback_query.register(
+        self.router.callback_query.register(
             self.edit_birth_data,
             F.data == "edit_birth_data"
         )
 
         # Обработчики состояний для ввода данных
-        router.message.register(
+        self.router.message.register(
             self.process_birth_date,
             StateFilter(AstrologyStates.waiting_for_date)
         )
 
-        router.callback_query.register(
-            self.process_birth_time_range,
-            F.data.startswith("time_range:"),
+        self.router.message.register(
+            self.process_birth_time,
             StateFilter(AstrologyStates.waiting_for_time)
         )
 
-        router.callback_query.register(
-            self.process_birth_city,
-            F.data.startswith("city_select:"),
+        self.router.message.register(
+            self.process_birth_place,
             StateFilter(AstrologyStates.waiting_for_place)
         )
 
-        router.message.register(
-            self.process_city_search,
-            StateFilter(AstrologyStates.waiting_for_place)
+        # Обработчики для callback в состояниях
+        self.router.callback_query.register(
+            self.skip_birth_time,
+            F.data == "skip_birth_time",
+            StateFilter(AstrologyStates.waiting_for_time)
         )
 
-        # Навигация
-        router.callback_query.register(
-            self.calendar_navigation,
-            F.data.startswith("calendar_nav:")
+        self.router.callback_query.register(
+            self.confirm_birth_data,
+            F.data == "confirm_birth_data",
+            StateFilter(AstrologyStates.confirming_data)
         )
 
+    @error_handler()
+    @log_action("astrology_command")
     async def cmd_astrology(
             self,
             message: Message,
@@ -190,22 +198,24 @@ class AstrologyHandlers(BaseHandler):
         await state.clear()
 
         async with get_unit_of_work() as uow:
-            user = await self.get_or_create_user(uow, message.from_user)
+            user = await get_or_create_user(message.from_user)
+            user_db = await uow.users.get_by_telegram_id(message.from_user.id)
 
             # Проверяем наличие данных рождения
-            has_birth_data = bool(user.birth_data)
+            has_birth_data = bool(user_db and hasattr(user_db, 'birth_date') and user_db.birth_date)
 
             # Получаем текущую фазу луны
             moon_phase = self._calculate_moon_phase()
 
+            # Используем фабрику клавиатур
             keyboard = await Keyboards.astrology_menu(
-                subscription_level=user.subscription_plan,
+                subscription_level=user_db.subscription_plan if user_db and hasattr(user_db, 'subscription_plan') else None,
                 has_birth_data=has_birth_data,
                 current_moon_phase=moon_phase["emoji"]
             )
 
-            text = await self._format_astrology_welcome(
-                user,
+            text = self._format_astrology_welcome(
+                user_db,
                 has_birth_data,
                 moon_phase
             )
@@ -216,6 +226,7 @@ class AstrologyHandlers(BaseHandler):
                 parse_mode="HTML"
             )
 
+    @error_handler()
     async def show_astrology_menu(
             self,
             callback: CallbackQuery,
@@ -228,68 +239,99 @@ class AstrologyHandlers(BaseHandler):
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
 
-            has_birth_data = bool(user.birth_data)
+            if not user:
+                await answer_callback_query(callback, "Необходимо начать с /start", show_alert=True)
+                return
+
+            has_birth_data = bool(hasattr(user, 'birth_date') and user.birth_date)
             moon_phase = self._calculate_moon_phase()
 
+            # Используем фабрику клавиатур
             keyboard = await Keyboards.astrology_menu(
-                subscription_level=user.subscription_plan,
+                subscription_level=user.subscription_plan if hasattr(user, 'subscription_plan') else None,
                 has_birth_data=has_birth_data,
                 current_moon_phase=moon_phase["emoji"]
             )
 
-            text = await self._format_astrology_welcome(
+            text = self._format_astrology_welcome(
                 user,
                 has_birth_data,
                 moon_phase
             )
 
-            await self.edit_or_send_message(
-                callback,
+            await edit_or_send_message(
+                callback.message,
                 text,
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
 
+        await answer_callback_query(callback)
+
+    @error_handler()
     async def show_horoscope_menu(
             self,
             callback: CallbackQuery,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Показать меню гороскопов."""
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
-
-            # Определяем знак зодиака если есть данные
-            user_sign = None
-            if user.birth_data and user.birth_data.get("date"):
-                birth_date = datetime.fromisoformat(user.birth_data["date"])
-                user_sign = self._get_zodiac_sign(birth_date)
-
-            keyboard = await Keyboards.horoscope_menu(
-                subscription_level=user.subscription_plan,
-                user_zodiac_sign=user_sign
-            )
+            subscription = user.subscription_plan if user and hasattr(user, 'subscription_plan') else "free"
 
             text = (
-                f"<b>{Emoji.STARS} Гороскопы</b>\n\n"
-                f"Выберите тип гороскопа:\n\n"
+                "📅 <b>Гороскопы</b>\n\n"
+                "Выберите тип гороскопа:"
             )
 
-            if user_sign:
-                text += f"Ваш знак: <b>{self._get_sign_name(user_sign)}</b>\n\n"
-            else:
-                text += (
-                    f"💡 <i>Добавьте данные рождения в профиле "
-                    f"для персональных гороскопов</i>\n\n"
-                )
+            # Используем фабрику клавиатур
+            keyboard = await Keyboards.horoscope_menu(subscription_level=subscription)
 
-            await self.edit_or_send_message(
-                callback,
+            await edit_or_send_message(
+                callback.message,
                 text,
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
 
+        await answer_callback_query(callback)
+
+    @error_handler()
+    @log_action("daily_horoscope")
+    async def horoscope_daily(
+            self,
+            callback: CallbackQuery,
+            state: FSMContext,
+            **kwargs
+    ) -> None:
+        """Быстрый доступ к дневному гороскопу."""
+        async with get_unit_of_work() as uow:
+            user = await uow.users.get_by_telegram_id(callback.from_user.id)
+
+            if not user:
+                await answer_callback_query(callback, "Необходимо начать с /start", show_alert=True)
+                return
+
+            # Если у пользователя есть данные рождения, сразу показываем гороскоп
+            if hasattr(user, 'birth_date') and user.birth_date:
+                zodiac_sign = self._get_zodiac_sign(user.birth_date)
+                await self._show_horoscope(callback, "daily", zodiac_sign, user)
+            else:
+                # Иначе просим выбрать знак
+                text = "🌟 Выберите ваш знак зодиака:"
+                keyboard = await Keyboards.zodiac_selection("daily")
+
+                await edit_or_send_message(
+                    callback.message,
+                    text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
+
+        await answer_callback_query(callback)
+
+    @error_handler()
     async def select_horoscope_type(
             self,
             callback: CallbackQuery,
@@ -302,43 +344,37 @@ class AstrologyHandlers(BaseHandler):
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
 
-            # Проверяем доступность для подписки
-            if not self._is_horoscope_available(horoscope_type, user.subscription_plan):
-                await callback.answer(
-                    "Этот тип гороскопа доступен только для Premium подписчиков",
+            # Проверяем доступность
+            if not self._is_horoscope_available(horoscope_type, user.subscription_plan if user else "free"):
+                await answer_callback_query(
+                    callback,
+                    "⭐ Этот тип гороскопа доступен только по подписке",
                     show_alert=True
                 )
                 return
 
-            # Если есть данные рождения, сразу показываем гороскоп
-            if user.birth_data and user.birth_data.get("date"):
-                birth_date = datetime.fromisoformat(user.birth_data["date"])
-                user_sign = self._get_zodiac_sign(birth_date)
+            # Сохраняем тип в состоянии
+            await state.update_data(horoscope_type=horoscope_type)
 
-                await self._show_horoscope(
-                    callback,
-                    horoscope_type,
-                    user_sign,
-                    user
-                )
+            # Если есть данные рождения, показываем гороскоп
+            if user and hasattr(user, 'birth_date') and user.birth_date:
+                zodiac_sign = self._get_zodiac_sign(user.birth_date)
+                await self._show_horoscope(callback, horoscope_type, zodiac_sign, user)
             else:
                 # Показываем выбор знака
-                await state.update_data(horoscope_type=horoscope_type)
+                text = "🌟 Выберите знак зодиака:"
+                keyboard = await Keyboards.zodiac_selection(horoscope_type)
 
-                keyboard = await Keyboards.zodiac_selection()
-
-                text = (
-                    f"<b>Выберите знак зодиака</b>\n\n"
-                    f"Для какого знака показать {self._get_horoscope_name(horoscope_type)}?"
-                )
-
-                await self.edit_or_send_message(
-                    callback,
+                await edit_or_send_message(
+                    callback.message,
                     text,
                     reply_markup=keyboard,
                     parse_mode="HTML"
                 )
 
+        await answer_callback_query(callback)
+
+    @error_handler()
     async def select_zodiac_sign(
             self,
             callback: CallbackQuery,
@@ -346,244 +382,110 @@ class AstrologyHandlers(BaseHandler):
             **kwargs
     ) -> None:
         """Выбор знака зодиака."""
-        sign = callback.data.split(":")[1]
-        data = await state.get_data()
-        horoscope_type = data.get("horoscope_type", "daily")
+        parts = callback.data.split(":")
+        horoscope_type = parts[1]
+        zodiac_sign = parts[2]
 
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
+            await self._show_horoscope(callback, horoscope_type, zodiac_sign, user)
 
-            await self._show_horoscope(
-                callback,
-                horoscope_type,
-                sign,
-                user
-            )
+        await answer_callback_query(callback)
 
-        await state.clear()
-
-    @require_subscription("basic")
+    @error_handler()
     async def show_natal_chart(
             self,
             callback: CallbackQuery,
+            state: FSMContext,
             **kwargs
     ) -> None:
         """Показать натальную карту."""
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
 
-            if not user.birth_data or not all(
-                    key in user.birth_data for key in ["date", "time", "place"]
-            ):
-                await callback.answer(
-                    "Сначала добавьте полные данные рождения",
-                    show_alert=True
-                )
+            if not user:
+                await answer_callback_query(callback, "Необходимо начать с /start", show_alert=True)
+                return
 
-                # Предлагаем ввести данные
-                keyboard = await Keyboards.birth_data_request()
-
+            # Проверяем наличие данных рождения
+            if not hasattr(user, 'birth_date') or not user.birth_date:
                 text = (
-                    f"<b>{Emoji.WARNING} Данные рождения не найдены</b>\n\n"
-                    f"Для построения натальной карты необходимы:\n"
-                    f"• Дата рождения\n"
-                    f"• Точное время рождения\n"
-                    f"• Место рождения\n\n"
-                    f"Хотите добавить эти данные?"
+                    "🗺 <b>Натальная карта</b>\n\n"
+                    "Для построения натальной карты необходимы:\n"
+                    "• Дата рождения\n"
+                    "• Время рождения (желательно)\n"
+                    "• Место рождения\n\n"
+                    "Пожалуйста, введите данные рождения:"
                 )
 
-                await self.edit_or_send_message(
-                    callback,
-                    text,
-                    reply_markup=keyboard,
-                    parse_mode="HTML"
+                # Используем InlineKeyboard для создания кнопок
+                keyboard = InlineKeyboard()
+                keyboard.add_button(text="📝 Ввести данные", callback_data="input_birth_data")
+                keyboard.add_button(text="◀️ Назад", callback_data="astrology_menu")
+                keyboard.builder.adjust(1)
+
+                keyboard_markup = await keyboard.build()
+            else:
+                # Строим натальную карту
+                astrology_service = get_astrology_service()
+                natal_chart = await astrology_service.calculate_natal_chart(
+                    user.birth_date,
+                    user.birth_time if hasattr(user, 'birth_time') else None,
+                    user.birth_place if hasattr(user, 'birth_place') else None
                 )
-                return
 
-            # Генерируем натальную карту
-            await callback.answer(f"{Emoji.LOADING} Рассчитываю натальную карту...")
+                text = self._format_natal_chart(natal_chart)
 
-            natal_data = await self._calculate_natal_chart(user.birth_data)
-            interpretation = await self._get_natal_interpretation(natal_data, user)
+                # Используем фабрику клавиатур
+                keyboard_markup = await Keyboards.natal_chart_menu()
 
-            # Сохраняем в БД
-            await uow.astrology.save_natal_chart(
-                user_id=user.id,
-                chart_data=natal_data,
-                interpretation=interpretation
-            )
-            await uow.commit()
-
-            # Форматируем сообщение
-            message = NatalChartMessage(
-                birth_data=user.birth_data,
-                planets=natal_data["planets"],
-                houses=natal_data["houses"],
-                aspects=natal_data["aspects"],
-                interpretation=interpretation
-            )
-
-            text = await message.format()
-
-            keyboard = await Keyboards.natal_chart_actions()
-
-            await self.edit_or_send_message(
-                callback,
+            await edit_or_send_message(
+                callback.message,
                 text,
-                reply_markup=keyboard,
+                reply_markup=keyboard_markup,
                 parse_mode="HTML"
             )
 
-    @require_subscription("premium")
-    async def show_transits_menu(
-            self,
-            callback: CallbackQuery,
-            **kwargs
-    ) -> None:
-        """Показать меню транзитов."""
-        async with get_unit_of_work() as uow:
-            user = await uow.users.get_by_telegram_id(callback.from_user.id)
+        await answer_callback_query(callback)
 
-            if not user.birth_data:
-                await callback.answer(
-                    "Для транзитов нужны данные рождения",
-                    show_alert=True
-                )
-                return
-
-            keyboard = await Keyboards.transits_menu()
-
-            text = (
-                f"<b>{Emoji.TRANSIT} Транзиты планет</b>\n\n"
-                f"Транзиты показывают, как текущее положение планет "
-                f"влияет на вашу натальную карту.\n\n"
-                f"Выберите период для анализа:"
-            )
-
-            await self.edit_or_send_message(
-                callback,
-                text,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-
-    async def select_transit_period(
-            self,
-            callback: CallbackQuery,
-            **kwargs
-    ) -> None:
-        """Выбор периода транзитов."""
-        period = callback.data.split(":")[1]
-
-        await callback.answer(f"{Emoji.LOADING} Рассчитываю транзиты...")
-
-        async with get_unit_of_work() as uow:
-            user = await uow.users.get_by_telegram_id(callback.from_user.id)
-
-            # Рассчитываем транзиты
-            transits = await self._calculate_transits(
-                user.birth_data,
-                period
-            )
-
-            # Получаем интерпретацию
-            interpretation = await self._get_transit_interpretation(
-                transits,
-                period,
-                user
-            )
-
-            # Форматируем сообщение
-            message = TransitMessage(
-                period=period,
-                transits=transits,
-                interpretation=interpretation
-            )
-
-            text = await message.format()
-
-            keyboard = await Keyboards.transit_actions(period)
-
-            await self.edit_or_send_message(
-                callback,
-                text,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-
-    @require_subscription("premium")
-    async def start_synastry(
+    @error_handler()
+    async def show_lunar_calendar(
             self,
             callback: CallbackQuery,
             state: FSMContext,
             **kwargs
     ) -> None:
-        """Начать анализ синастрии."""
-        async with get_unit_of_work() as uow:
-            user = await uow.users.get_by_telegram_id(callback.from_user.id)
-
-            if not user.birth_data:
-                await callback.answer(
-                    "Сначала добавьте свои данные рождения",
-                    show_alert=True
-                )
-                return
-
-            # Запускаем процесс ввода данных партнера
-            await state.set_state(AstrologyStates.synastry_partner_data)
-
-            text = (
-                f"<b>{Emoji.HEART} Анализ совместимости</b>\n\n"
-                f"Для анализа совместимости нужны данные партнера.\n\n"
-                f"Введите дату рождения партнера в формате ДД.ММ.ГГГГ\n"
-                f"Например: 15.03.1990"
-            )
-
-            keyboard = await Keyboards.cancel_only()
-
-            await self.edit_or_send_message(
-                callback,
-                text,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-
-    async def show_lunar_calendar(
-            self,
-            callback: CallbackQuery,
-            **kwargs
-    ) -> None:
         """Показать лунный календарь."""
-        # Рассчитываем данные на текущий месяц
         today = date.today()
-        lunar_days = await self._calculate_lunar_month(today)
-
-        # Форматируем календарь
-        keyboard = await Keyboards.lunar_calendar(
-            year=today.year,
-            month=today.month,
-            lunar_days=lunar_days,
-            selected_day=today.day
-        )
-
-        # Текущая фаза луны
-        current_phase = self._calculate_moon_phase()
+        moon_phase = self._calculate_moon_phase()
+        lunar_day = self._calculate_lunar_day()
 
         text = (
-            f"<b>{Emoji.MOON} Лунный календарь</b>\n\n"
-            f"<b>Сегодня:</b> {current_phase['emoji']} {current_phase['name']}\n"
-            f"<b>Лунный день:</b> {current_phase['day']}\n"
-            f"<b>Освещенность:</b> {current_phase['illumination']}%\n\n"
-            f"Выберите день для подробной информации:"
+            f"🌙 <b>Лунный календарь</b>\n\n"
+            f"<b>Сегодня:</b> {today.strftime('%d.%m.%Y')}\n"
+            f"<b>Лунный день:</b> {lunar_day['day']}-й\n"
+            f"<b>Фаза луны:</b> {moon_phase['emoji']} {moon_phase['name']}\n\n"
+            f"<b>Характеристика дня:</b>\n"
+            f"{lunar_day['description']}\n\n"
+            f"<b>Благоприятно:</b>\n"
+            f"✅ {lunar_day['good_for']}\n\n"
+            f"<b>Неблагоприятно:</b>\n"
+            f"❌ {lunar_day['bad_for']}"
         )
 
-        await self.edit_or_send_message(
-            callback,
+        # Используем фабрику клавиатур
+        keyboard = await Keyboards.lunar_calendar_menu()
+
+        await edit_or_send_message(
+            callback.message,
             text,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
 
+        await answer_callback_query(callback)
+
+    @error_handler()
     async def start_birth_data_input(
             self,
             callback: CallbackQuery,
@@ -591,537 +493,410 @@ class AstrologyHandlers(BaseHandler):
             **kwargs
     ) -> None:
         """Начать ввод данных рождения."""
-        await state.set_state(AstrologyStates.waiting_for_date)
-
         text = (
-            f"<b>{Emoji.CALENDAR} Ввод данных рождения</b>\n\n"
-            f"<b>Шаг 1 из 3: Дата рождения</b>\n\n"
-            f"Введите дату рождения в формате ДД.ММ.ГГГГ\n"
-            f"Например: 25.12.1990"
+            "📝 <b>Ввод данных рождения</b>\n\n"
+            "Шаг 1 из 3: Дата рождения\n\n"
+            "Введите вашу дату рождения в формате:\n"
+            "ДД.ММ.ГГГГ (например: 15.03.1990)"
         )
 
-        keyboard = await Keyboards.cancel_only()
+        # Используем кнопку отмены
+        keyboard = await Keyboards.cancel()
 
-        await self.edit_or_send_message(
-            callback,
+        await edit_or_send_message(
+            callback.message,
             text,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
 
+        await state.set_state(AstrologyStates.waiting_for_date)
+        await answer_callback_query(callback)
+
+    # Обработчики состояний
+
+    @error_handler()
     async def process_birth_date(
             self,
             message: Message,
-            state: FSMContext,
-            **kwargs
+            state: FSMContext
     ) -> None:
         """Обработка даты рождения."""
-        try:
-            # Парсим дату
-            date_parts = message.text.strip().split(".")
-            if len(date_parts) != 3:
-                raise ValueError("Неверный формат")
+        date_text = message.text.strip()
 
-            day, month, year = map(int, date_parts)
-            birth_date = datetime(year, month, day)
+        # Валидация формата
+        date_pattern = r'^\d{2}\.\d{2}\.\d{4}$'
+        if not re.match(date_pattern, date_text):
+            await message.answer(
+                "❌ Неверный формат даты.\n"
+                "Используйте формат ДД.ММ.ГГГГ (например: 15.03.1990)"
+            )
+            return
+
+        try:
+            birth_date = datetime.strptime(date_text, "%d.%m.%Y").date()
 
             # Проверяем корректность
-            if birth_date > datetime.now():
-                raise ValueError("Дата в будущем")
+            age = (date.today() - birth_date).days / 365.25
+            if age < 1 or age > 120:
+                await message.answer("❌ Пожалуйста, введите корректную дату рождения")
+                return
 
-            if birth_date < datetime(1900, 1, 1):
-                raise ValueError("Слишком старая дата")
+        except ValueError:
+            await message.answer("❌ Некорректная дата. Попробуйте еще раз:")
+            return
 
-            # Сохраняем и переходим к времени
-            await state.update_data(
-                birth_date=birth_date.isoformat()
-            )
-            await state.set_state(AstrologyStates.waiting_for_time)
+        # Сохраняем дату
+        await state.update_data(birth_date=birth_date)
 
-            # Показываем выбор времени
-            keyboard = await Keyboards.birth_time_selection()
-
-            text = (
-                f"<b>Шаг 2 из 3: Время рождения</b>\n\n"
-                f"Выберите диапазон времени рождения или точное время.\n"
-                f"Чем точнее время, тем точнее будут расчеты."
-            )
-
-            await message.answer(
-                text,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-
-        except Exception as e:
-            await message.answer(
-                f"{Emoji.ERROR} Неверный формат даты. "
-                f"Используйте формат ДД.ММ.ГГГГ\n"
-                f"Например: 25.12.1990"
-            )
-
-    async def process_birth_time_range(
-            self,
-            callback: CallbackQuery,
-            state: FSMContext,
-            **kwargs
-    ) -> None:
-        """Обработка выбора времени рождения."""
-        time_range = callback.data.split(":")[1]
-
-        # Определяем примерное время
-        time_map = {
-            "morning": "09:00",
-            "afternoon": "15:00",
-            "evening": "20:00",
-            "night": "02:00",
-            "unknown": "12:00"
-        }
-
-        birth_time = time_map.get(time_range, "12:00")
-
-        await state.update_data(birth_time=birth_time)
-        await state.set_state(AstrologyStates.waiting_for_place)
-
-        # Показываем выбор места
-        keyboard = await Keyboards.birth_place_selection()
-
+        # Переходим к времени
         text = (
-            f"<b>Шаг 3 из 3: Место рождения</b>\n\n"
-            f"Выберите город из списка популярных или введите название:"
+            "📝 <b>Ввод данных рождения</b>\n\n"
+            "Шаг 2 из 3: Время рождения\n\n"
+            "Введите время рождения в формате:\n"
+            "ЧЧ:ММ (например: 14:30)\n\n"
+            "Точное время важно для расчета домов и асцендента."
         )
 
-        await self.edit_or_send_message(
-            callback,
+        # Создаем клавиатуру с кнопками
+        keyboard = InlineKeyboard()
+        keyboard.add_button(text="⏭ Не знаю точное время", callback_data="skip_birth_time")
+        keyboard.add_button(text="❌ Отмена", callback_data="cancel:birth_data")
+        keyboard.builder.adjust(1)
+
+        await message.answer(
+            text,
+            reply_markup=await keyboard.build(),
+            parse_mode="HTML"
+        )
+
+        await state.set_state(AstrologyStates.waiting_for_time)
+
+    @error_handler()
+    async def process_birth_time(
+            self,
+            message: Message,
+            state: FSMContext
+    ) -> None:
+        """Обработка времени рождения."""
+        time_text = message.text.strip()
+
+        # Валидация формата
+        time_pattern = r'^\d{1,2}:\d{2}$'
+        if not re.match(time_pattern, time_text):
+            await message.answer(
+                "❌ Неверный формат времени.\n"
+                "Используйте формат ЧЧ:ММ (например: 14:30)"
+            )
+            return
+
+        try:
+            birth_time = datetime.strptime(time_text, "%H:%M").time()
+        except ValueError:
+            await message.answer("❌ Некорректное время. Попробуйте еще раз:")
+            return
+
+        # Сохраняем время
+        await state.update_data(birth_time=birth_time)
+
+        # Переходим к месту
+        text = (
+            "📝 <b>Ввод данных рождения</b>\n\n"
+            "Шаг 3 из 3: Место рождения\n\n"
+            "Введите город или населенный пункт:"
+        )
+
+        await message.answer(text, parse_mode="HTML")
+        await state.set_state(AstrologyStates.waiting_for_place)
+
+    @error_handler()
+    async def process_birth_place(
+            self,
+            message: Message,
+            state: FSMContext
+    ) -> None:
+        """Обработка места рождения."""
+        place = message.text.strip()
+
+        if len(place) < 2:
+            await message.answer("❌ Название слишком короткое. Попробуйте еще раз:")
+            return
+
+        # Сохраняем место
+        await state.update_data(birth_place=place)
+
+        # Получаем все данные
+        data = await state.get_data()
+
+        # Показываем подтверждение
+        text = (
+            "✅ <b>Проверьте данные:</b>\n\n"
+            f"<b>Дата:</b> {data['birth_date'].strftime('%d.%m.%Y')}\n"
+        )
+
+        if 'birth_time' in data:
+            text += f"<b>Время:</b> {data['birth_time'].strftime('%H:%M')}\n"
+        else:
+            text += "<b>Время:</b> не указано\n"
+
+        text += f"<b>Место:</b> {data['birth_place']}\n\n"
+        text += "Все верно?"
+
+        # Используем клавиатуру подтверждения
+        keyboard = await Keyboards.yes_no(
+            yes_data="confirm_birth_data",
+            no_data="edit_birth_data"
+        )
+
+        await message.answer(
             text,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
 
-    async def process_birth_city(
+        await state.set_state(AstrologyStates.confirming_data)
+
+    @error_handler()
+    async def skip_birth_time(
             self,
             callback: CallbackQuery,
-            state: FSMContext,
-            **kwargs
+            state: FSMContext
     ) -> None:
-        """Обработка выбора города рождения."""
-        city = callback.data.split(":")[1]
+        """Пропустить ввод времени рождения."""
+        # Переходим к месту рождения
+        text = (
+            "📝 <b>Ввод данных рождения</b>\n\n"
+            "Шаг 3 из 3: Место рождения\n\n"
+            "Введите город или населенный пункт:"
+        )
 
-        # Мапинг городов на координаты и часовые пояса
-        city_data = self._get_city_data(city)
+        await edit_or_send_message(
+            callback.message,
+            text,
+            parse_mode="HTML"
+        )
 
+        await state.set_state(AstrologyStates.waiting_for_place)
+        await answer_callback_query(callback)
+
+    @error_handler()
+    async def confirm_birth_data(
+            self,
+            callback: CallbackQuery,
+            state: FSMContext
+    ) -> None:
+        """Подтвердить и сохранить данные рождения."""
         data = await state.get_data()
-
-        # Сохраняем все данные
-        birth_data = {
-            "date": data["birth_date"],
-            "time": data["birth_time"],
-            "place": city_data["name"],
-            "lat": city_data["lat"],
-            "lon": city_data["lon"],
-            "timezone": city_data["timezone"]
-        }
 
         async with get_unit_of_work() as uow:
             user = await uow.users.get_by_telegram_id(callback.from_user.id)
-            user.birth_data = birth_data
-            await uow.commit()
 
+            if user:
+                # Обновляем данные пользователя
+                user.birth_date = data['birth_date']
+                user.birth_time = data.get('birth_time')
+                user.birth_place = data['birth_place']
+
+                await uow.users.update(user)
+                await uow.commit()
+
+        # Очищаем состояние
         await state.clear()
 
-        # Показываем подтверждение
-        await callback.answer(f"{Emoji.CHECK} Данные сохранены!")
-
-        keyboard = await Keyboards.birth_data_saved()
-
         text = (
-            f"<b>{Emoji.CHECK} Данные рождения сохранены!</b>\n\n"
-            f"<b>Дата:</b> {datetime.fromisoformat(birth_data['date']).strftime('%d.%m.%Y')}\n"
-            f"<b>Время:</b> {birth_data['time']}\n"
-            f"<b>Место:</b> {birth_data['place']}\n\n"
-            f"Теперь вам доступны:\n"
-            f"• Персональные гороскопы\n"
-            f"• Натальная карта\n"
-            f"• Транзиты планет\n"
-            f"• Анализ совместимости"
+            "✅ <b>Данные рождения сохранены!</b>\n\n"
+            "Теперь вам доступны:\n"
+            "• Персональные гороскопы\n"
+            "• Натальная карта\n"
+            "• Транзиты планет\n"
+            "• Анализ совместимости"
         )
 
-        await self.edit_or_send_message(
-            callback,
+        # Используем фабрику клавиатур
+        keyboard = await Keyboards.birth_data_saved()
+
+        await edit_or_send_message(
+            callback.message,
             text,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
 
+        await answer_callback_query(callback)
+
     # Вспомогательные методы
 
-    async def _format_astrology_welcome(
+    def _format_astrology_welcome(
             self,
-            user,
+            user: Any,
             has_birth_data: bool,
             moon_phase: Dict[str, Any]
     ) -> str:
         """Форматировать приветствие раздела астрологии."""
-        builder = MessageBuilder(MessageStyle.HTML)
+        text = "🔮 <b>Астрология</b>\n\n"
 
-        builder.add_bold(f"{Emoji.STARS} Астрология").add_line(2)
-
-        builder.add_text(
+        text += (
             "Откройте тайны звезд и планет. "
-            "Узнайте, что говорит космос о вашей судьбе."
-        ).add_line(2)
+            "Узнайте, что говорит космос о вашей судьбе.\n\n"
+        )
 
         # Информация о луне
-        builder.add_text(
-            f"Сегодня: {moon_phase['emoji']} {moon_phase['name']}"
-        ).add_line()
+        text += f"Сегодня: {moon_phase['emoji']} {moon_phase['name']}\n"
 
-        if has_birth_data:
-            builder.add_text(f"✅ Данные рождения сохранены").add_line()
+        if has_birth_data and user:
+            text += "✅ Данные рождения сохранены\n"
 
             # Определяем знак зодиака
-            birth_date = datetime.fromisoformat(user.birth_data["date"])
-            sign = self._get_zodiac_sign(birth_date)
-            sign_name = self._get_sign_name(sign)
-
-            builder.add_text(f"Ваш знак: <b>{sign_name}</b>").add_line()
+            if hasattr(user, 'birth_date') and user.birth_date:
+                sign = self._get_zodiac_sign(user.birth_date)
+                sign_name = self._get_sign_name(sign)
+                text += f"Ваш знак: <b>{sign_name}</b>\n"
         else:
-            builder.add_text(
-                f"💡 <i>Добавьте данные рождения для персональных прогнозов</i>"
-            ).add_line()
+            text += "💡 <i>Добавьте данные рождения для персональных прогнозов</i>\n"
 
-        builder.add_line()
-        builder.add_italic("Что бы вы хотели узнать?")
+        text += "\nЧто бы вы хотели узнать?"
 
-        return builder.build()
+        return text
 
     async def _show_horoscope(
             self,
             callback: CallbackQuery,
             horoscope_type: str,
             zodiac_sign: str,
-            user
+            user: Any
     ) -> None:
         """Показать гороскоп."""
-        await callback.answer(f"{Emoji.LOADING} Составляю гороскоп...")
+        astrology_service = get_astrology_service()
 
-        # Проверяем кэш
-        async with get_unit_of_work() as uow:
-            cached = await uow.astrology.get_cached_horoscope(
-                zodiac_sign,
-                horoscope_type,
-                date.today()
-            )
-
-            if cached:
-                horoscope_data = cached
-            else:
-                # Генерируем новый гороскоп
-                horoscope_data = await self._generate_horoscope(
-                    zodiac_sign,
-                    horoscope_type,
-                    user
-                )
-
-                # Сохраняем в кэш
-                await uow.astrology.cache_horoscope(
-                    zodiac_sign,
-                    horoscope_type,
-                    date.today(),
-                    horoscope_data
-                )
-                await uow.commit()
-
-        # Форматируем сообщение
-        message = HoroscopeMessage(
-            zodiac_sign=zodiac_sign,
-            period_type=horoscope_type,
-            period_dates=self._get_period_dates(horoscope_type),
-            general_prediction=horoscope_data["general"],
-            love_prediction=horoscope_data.get("love"),
-            career_prediction=horoscope_data.get("career"),
-            health_prediction=horoscope_data.get("health"),
-            lucky_numbers=horoscope_data.get("lucky_numbers"),
-            lucky_color=horoscope_data.get("lucky_color")
-        )
-
-        text = await message.format()
-
-        keyboard = await Keyboards.horoscope_actions(
+        # Получаем гороскоп
+        horoscope = await astrology_service.get_horoscope(
             zodiac_sign,
             horoscope_type,
-            can_save=user.subscription_plan != "free"
+            user.id if user else None
         )
 
-        await self.edit_or_send_message(
-            callback,
+        sign_name = self._get_sign_name(zodiac_sign)
+        period = self._get_period_dates(horoscope_type)
+
+        text = (
+            f"{sign_name}\n"
+            f"<b>{self._get_horoscope_name(horoscope_type).title()} гороскоп</b>\n"
+            f"<i>{period}</i>\n\n"
+            f"{horoscope['text']}\n\n"
+        )
+
+        if horoscope.get('lucky_numbers'):
+            text += f"<b>Счастливые числа:</b> {', '.join(map(str, horoscope['lucky_numbers']))}\n"
+
+        if horoscope.get('lucky_color'):
+            text += f"<b>Цвет дня:</b> {horoscope['lucky_color']}\n"
+
+        # Используем фабрику клавиатур для создания меню результата
+        keyboard = await Keyboards.horoscope_result(
+            horoscope_type=horoscope_type,
+            zodiac_sign=zodiac_sign
+        )
+
+        await edit_or_send_message(
+            callback.message,
             text,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
 
-    async def _generate_horoscope(
-            self,
-            zodiac_sign: str,
-            horoscope_type: str,
-            user
-    ) -> Dict[str, Any]:
-        """Генерировать гороскоп с помощью AI."""
-        sign_name = self._get_sign_name(zodiac_sign)
-        period_name = self._get_horoscope_name(horoscope_type)
+    def _format_natal_chart(self, natal_chart: Dict[str, Any]) -> str:
+        """Форматировать натальную карту."""
+        text = "🗺 <b>Ваша натальная карта</b>\n\n"
 
-        prompt = f"""
-        Составь {period_name} гороскоп для знака {sign_name}.
+        # Основные показатели
+        text += "<b>Планеты в знаках:</b>\n"
+        for planet, sign in natal_chart['planets'].items():
+            text += f"• {planet}: {sign}\n"
 
-        Структура ответа:
-        1. Общий прогноз (3-4 предложения)
-        2. Любовь и отношения (2-3 предложения)
-        3. Карьера и финансы (2-3 предложения)
-        4. Здоровье (1-2 предложения)
+        text += "\n<b>Дома:</b>\n"
+        for house, sign in natal_chart['houses'].items()[:4]:  # Показываем первые 4 дома
+            text += f"• {house}: {sign}\n"
 
-        Стиль: позитивный, конструктивный, с конкретными советами.
-        Избегай общих фраз, давай практические рекомендации.
-        """
+        text += f"\n<b>Асцендент:</b> {natal_chart['ascendant']}\n"
+        text += f"<b>МС (Середина неба):</b> {natal_chart['midheaven']}\n"
 
-        llm = await get_llm_manager()
-        response = await llm.generate_completion(
-            prompt,
-            temperature=0.8,
-            max_tokens=500
-        )
+        if natal_chart.get('aspects'):
+            text += "\n<b>Основные аспекты:</b>\n"
+            for aspect in natal_chart['aspects'][:3]:  # Показываем 3 главных аспекта
+                text += f"• {aspect}\n"
 
-        # Парсим ответ
-        # В реальной реализации нужен более сложный парсинг
-        sections = response.split("\n\n")
-
-        horoscope_data = {
-            "general": sections[0] if len(sections) > 0 else "Общий прогноз",
-            "love": sections[1] if len(sections) > 1 else None,
-            "career": sections[2] if len(sections) > 2 else None,
-            "health": sections[3] if len(sections) > 3 else None,
-            "lucky_numbers": [7, 14, 23],  # Можно генерировать
-            "lucky_color": "синий"  # Можно выбирать по знаку
-        }
-
-        return horoscope_data
-
-    async def _calculate_natal_chart(
-            self,
-            birth_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Рассчитать натальную карту."""
-        # Здесь должны быть астрологические расчеты
-        # Упрощенная версия для примера
-
-        return {
-            "planets": {
-                "sun": {"sign": "aries", "degree": 15.5, "house": 1},
-                "moon": {"sign": "cancer", "degree": 22.3, "house": 4},
-                "mercury": {"sign": "aries", "degree": 20.1, "house": 1},
-                "venus": {"sign": "pisces", "degree": 10.7, "house": 12},
-                "mars": {"sign": "leo", "degree": 5.2, "house": 5},
-                "jupiter": {"sign": "sagittarius", "degree": 18.9, "house": 9},
-                "saturn": {"sign": "capricorn", "degree": 25.4, "house": 10},
-                "uranus": {"sign": "aquarius", "degree": 12.6, "house": 11},
-                "neptune": {"sign": "pisces", "degree": 8.3, "house": 12},
-                "pluto": {"sign": "scorpio", "degree": 14.7, "house": 8}
-            },
-            "houses": {
-                1: {"sign": "aries", "degree": 0},
-                2: {"sign": "taurus", "degree": 30},
-                3: {"sign": "gemini", "degree": 60},
-                4: {"sign": "cancer", "degree": 90},
-                5: {"sign": "leo", "degree": 120},
-                6: {"sign": "virgo", "degree": 150},
-                7: {"sign": "libra", "degree": 180},
-                8: {"sign": "scorpio", "degree": 210},
-                9: {"sign": "sagittarius", "degree": 240},
-                10: {"sign": "capricorn", "degree": 270},
-                11: {"sign": "aquarius", "degree": 300},
-                12: {"sign": "pisces", "degree": 330}
-            },
-            "aspects": [
-                {"planet1": "sun", "planet2": "moon", "type": "square", "orb": 2.5},
-                {"planet1": "venus", "planet2": "jupiter", "type": "trine", "orb": 1.2},
-                {"planet1": "mars", "planet2": "saturn", "type": "opposition", "orb": 0.8}
-            ]
-        }
-
-    async def _get_natal_interpretation(
-            self,
-            natal_data: Dict[str, Any],
-            user
-    ) -> str:
-        """Получить интерпретацию натальной карты от AI."""
-        # Формируем описание для AI
-        planets_desc = []
-        for planet, data in natal_data["planets"].items():
-            planets_desc.append(
-                f"{planet} в {data['sign']} в {data['house']} доме"
-            )
-
-        prompt = f"""
-        Дай краткую интерпретацию натальной карты.
-
-        Основные позиции:
-        {chr(10).join(planets_desc[:5])}  # Только основные планеты
-
-        Дай общую характеристику личности (3-4 предложения),
-        основные таланты и вызовы.
-        Будь конкретным и позитивным.
-        """
-
-        llm = await get_llm_manager()
-        interpretation = await llm.generate_completion(
-            prompt,
-            temperature=0.7,
-            max_tokens=300
-        )
-
-        return interpretation
-
-    async def _calculate_transits(
-            self,
-            birth_data: Dict[str, Any],
-            period: str
-    ) -> List[Dict[str, Any]]:
-        """Рассчитать транзиты на период."""
-        # Упрощенный пример транзитов
-        transits = [
-            {
-                "planet": "jupiter",
-                "aspect": "trine",
-                "natal_planet": "sun",
-                "exact_date": date.today() + timedelta(days=5),
-                "orb": 1.2,
-                "importance": "high",
-                "sphere": "career"
-            },
-            {
-                "planet": "saturn",
-                "aspect": "square",
-                "natal_planet": "moon",
-                "exact_date": date.today() + timedelta(days=15),
-                "orb": 2.5,
-                "importance": "medium",
-                "sphere": "emotions"
-            }
-        ]
-
-        return transits
-
-    async def _get_transit_interpretation(
-            self,
-            transits: List[Dict[str, Any]],
-            period: str,
-            user
-    ) -> str:
-        """Получить интерпретацию транзитов от AI."""
-        # Формируем описание транзитов
-        transit_desc = []
-        for t in transits[:3]:  # Берем топ-3
-            transit_desc.append(
-                f"{t['planet']} {t['aspect']} к натальному {t['natal_planet']}"
-            )
-
-        prompt = f"""
-        Дай интерпретацию транзитов на {self._get_period_name(period)}.
-
-        Основные транзиты:
-        {chr(10).join(transit_desc)}
-
-        Опиши общую атмосферу периода и дай 2-3 конкретных совета.
-        Будь позитивным и практичным.
-        """
-
-        llm = await get_llm_manager()
-        interpretation = await llm.generate_completion(
-            prompt,
-            temperature=0.7,
-            max_tokens=250
-        )
-
-        return interpretation
-
-    async def _calculate_lunar_month(
-            self,
-            target_date: date
-    ) -> Dict[int, Dict[str, Any]]:
-        """Рассчитать лунные дни на месяц."""
-        lunar_days = {}
-
-        # Упрощенный расчет для примера
-        for day in range(1, 32):
-            try:
-                current_date = date(target_date.year, target_date.month, day)
-                lunar_day = ((current_date.day + target_date.month * 2) % 30) + 1
-
-                lunar_days[day] = {
-                    "lunar_day": lunar_day,
-                    "phase": self._get_moon_phase_for_day(lunar_day)
-                }
-            except ValueError:
-                # Дня нет в этом месяце
-                pass
-
-        return lunar_days
+        return text
 
     def _calculate_moon_phase(self) -> Dict[str, Any]:
         """Рассчитать текущую фазу луны."""
-        # Упрощенный расчет для примера
+        # Упрощенный расчет фазы луны
+        # В реальности нужен более точный алгоритм
         today = date.today()
 
-        # Известное новолуние для расчета
+        # Известная новолуние
+        known_new_moon = date(2024, 1, 11)
+
+        # Лунный цикл примерно 29.53 дня
+        lunar_cycle = 29.53
+
+        days_since = (today - known_new_moon).days
+        phase_index = (days_since % lunar_cycle) / lunar_cycle
+
+        if phase_index < 0.03 or phase_index > 0.97:
+            return {"emoji": "🌑", "name": "Новолуние", "phase": 0}
+        elif phase_index < 0.22:
+            return {"emoji": "🌒", "name": "Растущий месяц", "phase": 1}
+        elif phase_index < 0.28:
+            return {"emoji": "🌓", "name": "Первая четверть", "phase": 2}
+        elif phase_index < 0.47:
+            return {"emoji": "🌔", "name": "Растущая луна", "phase": 3}
+        elif phase_index < 0.53:
+            return {"emoji": "🌕", "name": "Полнолуние", "phase": 4}
+        elif phase_index < 0.72:
+            return {"emoji": "🌖", "name": "Убывающая луна", "phase": 5}
+        elif phase_index < 0.78:
+            return {"emoji": "🌗", "name": "Последняя четверть", "phase": 6}
+        else:
+            return {"emoji": "🌘", "name": "Убывающий месяц", "phase": 7}
+
+    def _calculate_lunar_day(self) -> Dict[str, Any]:
+        """Рассчитать лунный день."""
+        moon_phase = self._calculate_moon_phase()
+
+        # Упрощенный расчет лунного дня
+        today = date.today()
         known_new_moon = date(2024, 1, 11)
         days_since = (today - known_new_moon).days
+        lunar_day = (days_since % 30) + 1
 
-        # Лунный месяц ~29.53 дня
-        lunar_month = 29.53
-        phase_days = days_since % lunar_month
+        # Характеристики лунных дней (упрощенно)
+        lunar_days_info = {
+            1: {
+                "description": "День планирования и новых начинаний",
+                "good_for": "Планирование, медитация, очищение",
+                "bad_for": "Активные действия, споры"
+            },
+            15: {
+                "description": "День искушений и соблазнов",
+                "good_for": "Творчество, развлечения",
+                "bad_for": "Важные решения, диета"
+            },
+            # Добавить остальные дни...
+        }
 
-        # Определяем фазу
-        if phase_days < 1.84:
-            phase = {"name": "Новолуние", "emoji": "🌑", "percent": 0}
-        elif phase_days < 5.53:
-            phase = {"name": "Растущий серп", "emoji": "🌒", "percent": 25}
-        elif phase_days < 9.22:
-            phase = {"name": "Первая четверть", "emoji": "🌓", "percent": 50}
-        elif phase_days < 12.91:
-            phase = {"name": "Растущая луна", "emoji": "🌔", "percent": 75}
-        elif phase_days < 16.61:
-            phase = {"name": "Полнолуние", "emoji": "🌕", "percent": 100}
-        elif phase_days < 20.30:
-            phase = {"name": "Убывающая луна", "emoji": "🌖", "percent": 75}
-        elif phase_days < 23.99:
-            phase = {"name": "Последняя четверть", "emoji": "🌗", "percent": 50}
-        else:
-            phase = {"name": "Убывающий серп", "emoji": "🌘", "percent": 25}
+        info = lunar_days_info.get(lunar_day, {
+            "description": "Обычный лунный день",
+            "good_for": "Повседневные дела",
+            "bad_for": "Рискованные предприятия"
+        })
 
-        phase["day"] = int(phase_days) + 1
-        phase["illumination"] = abs(phase["percent"])
+        return {
+            "day": lunar_day,
+            "emoji": moon_phase["emoji"],
+            **info
+        }
 
-        return phase
-
-    def _get_moon_phase_for_day(self, lunar_day: int) -> str:
-        """Получить эмодзи фазы луны для дня."""
-        if lunar_day <= 2:
-            return "🌑"
-        elif lunar_day <= 6:
-            return "🌒"
-        elif lunar_day <= 9:
-            return "🌓"
-        elif lunar_day <= 13:
-            return "🌔"
-        elif lunar_day <= 17:
-            return "🌕"
-        elif lunar_day <= 21:
-            return "🌖"
-        elif lunar_day <= 24:
-            return "🌗"
-        else:
-            return "🌘"
-
-    def _get_zodiac_sign(self, birth_date: datetime) -> str:
+    def _get_zodiac_sign(self, birth_date: date) -> str:
         """Определить знак зодиака по дате."""
         month = birth_date.month
         day = birth_date.day
@@ -1184,16 +959,6 @@ class AstrologyHandlers(BaseHandler):
 
         return ""
 
-    def _get_period_name(self, period: str) -> str:
-        """Получить название периода."""
-        names = {
-            "today": "сегодня",
-            "week": "неделю",
-            "month": "месяц",
-            "year": "год"
-        }
-        return names.get(period, period)
-
     def _is_horoscope_available(
             self,
             horoscope_type: str,
@@ -1209,34 +974,18 @@ class AstrologyHandlers(BaseHandler):
 
         return False
 
-    def _get_city_data(self, city_code: str) -> Dict[str, Any]:
-        """Получить данные города."""
-        cities = {
-            "moscow": {
-                "name": "Москва",
-                "lat": 55.7558,
-                "lon": 37.6173,
-                "timezone": "Europe/Moscow"
-            },
-            "spb": {
-                "name": "Санкт-Петербург",
-                "lat": 59.9311,
-                "lon": 30.3609,
-                "timezone": "Europe/Moscow"
-            },
-            "almaty": {
-                "name": "Алматы",
-                "lat": 43.2220,
-                "lon": 76.8512,
-                "timezone": "Asia/Almaty"
-            },
-            # Добавить больше городов
-        }
 
-        return cities.get(city_code, cities["moscow"])
+# Функция для регистрации обработчика
+def register_astrology_handler(router: Router) -> None:
+    """
+    Регистрация обработчика астрологии.
+
+    Args:
+        router: Роутер для регистрации
+    """
+    handler = AstrologyHandlers(router)
+    handler.register_handlers()
+    logger.info("Astrology handler зарегистрирован")
 
 
-def setup(router: Router) -> None:
-    """Настройка обработчиков астрологии."""
-    handler = AstrologyHandlers()
-    handler.register_handlers(router)
+logger.info("Модуль обработчика астрологии загружен")

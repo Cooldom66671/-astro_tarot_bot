@@ -42,6 +42,7 @@ from .base import (
     PaginationCallbackData,
     MenuCallbackData,
     ConfirmCallbackData,
+    RefreshCallbackData,  # ДОБАВЛЕН ИМПОРТ
 
     # Утилиты
     parse_callback_data,
@@ -196,6 +197,33 @@ class Keyboards:
         return await KeyboardFactory.get_back_keyboard(callback_data)
 
     @staticmethod
+    async def cancel(callback_data: str = "cancel") -> InlineKeyboardMarkup:
+        """Получить клавиатуру с кнопкой Отмена."""
+        keyboard = InlineKeyboard()
+        keyboard.add_cancel_button(callback_data)
+        return await keyboard.build()
+
+    @staticmethod
+    async def close() -> InlineKeyboardMarkup:
+        """Получить клавиатуру с кнопкой Закрыть."""
+        keyboard = InlineKeyboard()
+        keyboard.add_button(
+            text="❌ Закрыть",
+            callback_data="close"
+        )
+        return await keyboard.build()
+
+    @staticmethod
+    async def menu_button() -> InlineKeyboardMarkup:
+        """Получить клавиатуру с кнопкой перехода в меню."""
+        keyboard = InlineKeyboard()
+        keyboard.add_button(
+            text="📋 Главное меню",
+            callback_data="main_menu"
+        )
+        return await keyboard.build()
+
+    @staticmethod
     async def welcome(user_name: Optional[str] = None) -> InlineKeyboardMarkup:
         """Получить приветственную клавиатуру."""
         return await get_welcome_keyboard(user_name)
@@ -218,6 +246,21 @@ class Keyboards:
         if isinstance(section, str):
             section = MainMenuSection(section)
         return await get_section_menu(section, user_subscription)
+
+    @staticmethod
+    def subscription_offer() -> InlineKeyboardMarkup:
+        """Получить клавиатуру с предложением подписки."""
+        keyboard = InlineKeyboard()
+        keyboard.add_button(
+            text="⭐ Оформить подписку",
+            callback_data=SubscriptionCallbackData(action="plans").pack()
+        )
+        keyboard.add_button(
+            text="◀️ Назад",
+            callback_data="back"
+        )
+        keyboard.builder.adjust(1, 1)
+        return keyboard.builder.as_markup()
 
 
 # Контекстные клавиатуры
@@ -533,10 +576,26 @@ __all__ = [
 
     # Callback Data
     "BaseCallbackData",
+    "PaginationCallbackData",
+    "MenuCallbackData",
+    "ConfirmCallbackData",
+    "RefreshCallbackData",  # ДОБАВЛЕН В ЭКСПОРТ
     "MainMenuCallbackData",
+    "QuickActionCallbackData",
     "TarotCallbackData",
+    "SpreadCallbackData",
+    "CardCallbackData",
     "AstrologyCallbackData",
+    "BirthDataCallbackData",
     "SubscriptionCallbackData",
+    "PaymentCallbackData",
+
+    # Функции
+    "get_main_menu",
+    "get_section_menu",
+    "get_welcome_keyboard",
+    "get_birth_data_keyboard",
+    "get_promo_code_keyboard",
 
     # Утилиты
     "parse_callback_data",

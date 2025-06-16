@@ -16,17 +16,16 @@ Middleware компоненты для обработки запросов.
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Callable, Dict, Any, Awaitable, Optional
-from functools import wraps
+from typing import Callable, Dict, Any, Awaitable, Optional, Union
 
 from aiogram import BaseMiddleware
-from aiogram.types import Message, CallbackQuery, TelegramObject, User
+from aiogram.types import Message, CallbackQuery, TelegramObject, User, Update
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramRetryAfter
+from aiogram.dispatcher.event.handler import HandlerObject
 
 from infrastructure import get_unit_of_work
-from infrastructure.telegram import MessageFactory, MessageStyle
-from bot.config.constants import RateLimits
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +111,8 @@ class DatabaseMiddleware(BaseMiddleware):
                 if db_user:
                     data['db_user'] = db_user
                     # Обновляем последнюю активность
-                    db_user.last_active = datetime.utcnow()
+                    db_user.last_active_at = datetime.utcnow()
+                    await uow.users.update(db_user)
                     await uow.commit()
 
             return await handler(event, data)
@@ -121,9 +121,20 @@ class DatabaseMiddleware(BaseMiddleware):
 class ThrottlingMiddleware(BaseMiddleware):
     """Middleware для ограничения частоты запросов."""
 
+    # Определяем лимиты прямо в классе
+    RATE_LIMITS = {
+        'feature_command': (5, 60),    # 5 в минуту
+        'basic_command': (10, 60),      # 10 в минуту
+        'tarot_action': (3, 60),        # 3 в минуту
+        'astrology_action': (3, 60),    # 3 в минуту
+        'payment_action': (5, 300),     # 5 за 5 минут
+        'message': (20, 60),            # 20 в минуту
+        'callback': (30, 60),           # 30 в минуту
+        'other': (15, 60)               # 15 в минуту
+    }
+
     def __init__(self):
         self.user_timestamps: Dict[int, Dict[str, list]] = {}
-        self.rate_limits = RateLimits()
 
     async def __call__(
             self,
@@ -220,18 +231,7 @@ class ThrottlingMiddleware(BaseMiddleware):
 
     def _get_rate_limit(self, action_type: str) -> tuple[int, int]:
         """Получить лимиты для типа действия."""
-        limits = {
-            'feature_command': (5, 60),  # 5 в минуту
-            'basic_command': (10, 60),  # 10 в минуту
-            'tarot_action': (3, 60),  # 3 в минуту
-            'astrology_action': (3, 60),  # 3 в минуту
-            'payment_action': (5, 300),  # 5 за 5 минут
-            'message': (20, 60),  # 20 в минуту
-            'callback': (30, 60),  # 30 в минуту
-            'other': (15, 60)  # 15 в минуту
-        }
-
-        return limits.get(action_type, (15, 60))
+        return self.RATE_LIMITS.get(action_type, (15, 60))
 
 
 class SubscriptionMiddleware(BaseMiddleware):
@@ -256,17 +256,18 @@ class SubscriptionMiddleware(BaseMiddleware):
         # Проверяем подписку
         uow = data.get('uow')
         if uow:
-            subscription = await uow.subscriptions.get_active(db_user.id)
+            subscription = await uow.subscriptions.get_active_by_user_id(db_user.id)
             data['subscription'] = subscription
 
             # Добавляем уровень подписки
-            data['subscription_level'] = db_user.subscription_plan
+            data['subscription_level'] = db_user.subscription_plan if hasattr(db_user, 'subscription_plan') else 'free'
 
             # Проверяем, не истекла ли подписка
-            if subscription and subscription.end_date < datetime.utcnow():
+            if subscription and hasattr(subscription, 'expires_at') and subscription.expires_at < datetime.utcnow():
                 # Деактивируем подписку
                 subscription.is_active = False
                 db_user.subscription_plan = 'free'
+                await uow.users.update(db_user)
                 await uow.commit()
 
                 # Уведомляем пользователя
@@ -412,14 +413,15 @@ class AdminCheckMiddleware(BaseMiddleware):
 
             command = event.text.split()[0]
             if command in admin_commands:
-                db_user = data.get('db_user')
-                if not db_user or not db_user.is_admin:
+                user = event.from_user
+                # Проверяем по списку админов из конфига
+                if user.id not in settings.bot.admin_ids:
                     await event.answer(
                         "⛔ У вас нет прав для выполнения этой команды."
                     )
                     logger.warning(
                         f"Unauthorized admin command attempt: "
-                        f"{command} by user {event.from_user.id}"
+                        f"{command} by user {user.id}"
                     )
                     return None
 
@@ -440,7 +442,7 @@ class I18nMiddleware(BaseMiddleware):
 
         if db_user:
             # Устанавливаем язык из настроек пользователя
-            data['locale'] = db_user.language or 'ru'
+            data['locale'] = getattr(db_user, 'language_code', 'ru')
         else:
             # Используем язык из Telegram
             user = getattr(event, 'from_user', None)
@@ -484,9 +486,11 @@ class ErrorHandlingMiddleware(BaseMiddleware):
 
             # Пытаемся уведомить пользователя
             try:
-                error_message = MessageFactory.create(
-                    'critical_error',
-                    MessageStyle.HTML
+                error_message = (
+                    "❌ <b>Произошла ошибка</b>\n\n"
+                    "К сожалению, что-то пошло не так. "
+                    "Попробуйте повторить позже или обратитесь в поддержку.\n\n"
+                    "Используйте /start для перезапуска."
                 )
 
                 if isinstance(event, Message):
@@ -503,6 +507,14 @@ class ErrorHandlingMiddleware(BaseMiddleware):
 
 class StateTimeoutMiddleware(BaseMiddleware):
     """Middleware для контроля таймаутов состояний FSM."""
+
+    # Таймауты для различных состояний (в секундах)
+    STATE_TIMEOUTS = {
+        'default': 600,  # 10 минут по умолчанию
+        'waiting_for_payment': 1800,  # 30 минут для оплаты
+        'waiting_for_text': 300,  # 5 минут для ввода текста
+        'selecting_cards': 900,  # 15 минут для выбора карт
+    }
 
     def __init__(self):
         self.state_timestamps: Dict[int, datetime] = {}
@@ -529,9 +541,12 @@ class StateTimeoutMiddleware(BaseMiddleware):
                 if user_id in self.state_timestamps:
                     time_in_state = datetime.utcnow() - self.state_timestamps[user_id]
 
-                    # Импортируем утилиты состояний
-                    from bot.states import StateUtils
-                    timeout = StateUtils.get_timeout(current_state)
+                    # Получаем таймаут для текущего состояния
+                    timeout = self.STATE_TIMEOUTS.get('default', 600)
+                    for state_key in self.STATE_TIMEOUTS:
+                        if state_key in current_state:
+                            timeout = self.STATE_TIMEOUTS[state_key]
+                            break
 
                     if time_in_state.total_seconds() > timeout:
                         # Очищаем состояние
@@ -539,8 +554,10 @@ class StateTimeoutMiddleware(BaseMiddleware):
 
                         # Уведомляем пользователя
                         if isinstance(event, Message):
-                            cancel_message = StateUtils.get_cancel_message(current_state)
-                            await event.answer(f"⏰ Время ожидания истекло.\n{cancel_message}")
+                            await event.answer(
+                                "⏰ Время ожидания истекло.\n"
+                                "Используйте /menu для возврата в главное меню."
+                            )
 
                         # Удаляем временную метку
                         del self.state_timestamps[user_id]
@@ -567,7 +584,8 @@ __all__ = [
     'AdminCheckMiddleware',
     'I18nMiddleware',
     'ErrorHandlingMiddleware',
-    'StateTimeoutMiddleware'
+    'StateTimeoutMiddleware',
+    'setup_middleware'
 ]
 
 
@@ -584,37 +602,32 @@ def setup_middleware(dp):
     i18n_middleware = I18nMiddleware()
     state_timeout_middleware = StateTimeoutMiddleware()
 
-    # Регистрируем в правильном порядке
-    # Сначала обработка ошибок и логирование
-    dp.message.middleware(error_middleware)
-    dp.callback_query.middleware(error_middleware)
+    # Регистрируем в правильном порядке для aiogram 3.x
+    # Для глобальных middleware используем update.middleware
 
-    dp.message.middleware(logging_middleware)
-    dp.callback_query.middleware(logging_middleware)
+    # Сначала обработка ошибок и логирование (для всех типов событий)
+    dp.update.middleware(error_middleware)
+    dp.update.middleware(logging_middleware)
+    dp.update.middleware(metrics_middleware)
 
-    # Затем метрики
-    dp.message.middleware(metrics_middleware)
-    dp.callback_query.middleware(metrics_middleware)
-
+    # Затем специфичные middleware для message и callback_query
     # Проверка частоты запросов
     dp.message.middleware(throttling_middleware)
     dp.callback_query.middleware(throttling_middleware)
 
     # База данных и пользователь
-    dp.message.middleware(database_middleware)
-    dp.callback_query.middleware(database_middleware)
+    dp.update.middleware(database_middleware)
 
     # Подписка и права
-    dp.message.middleware(subscription_middleware)
-    dp.callback_query.middleware(subscription_middleware)
+    dp.update.middleware(subscription_middleware)
 
+    # Проверка админских прав только для сообщений
     dp.message.middleware(admin_middleware)
-    dp.callback_query.middleware(admin_middleware)
 
-    # Языки и таймауты
-    dp.message.middleware(i18n_middleware)
-    dp.callback_query.middleware(i18n_middleware)
+    # Языки для всех типов
+    dp.update.middleware(i18n_middleware)
 
+    # Таймауты состояний
     dp.message.middleware(state_timeout_middleware)
     dp.callback_query.middleware(state_timeout_middleware)
 

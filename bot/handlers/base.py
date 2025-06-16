@@ -12,10 +12,11 @@
 Дата создания: 2024-12-30
 """
 
+import asyncio
 import logging
 import functools
 import time
-from typing import Optional, Dict, Any, Callable, Union
+from typing import Optional, Dict, Any, Callable, Union, List, Type
 from datetime import datetime
 
 from aiogram import Router, types
@@ -23,11 +24,21 @@ from aiogram.filters import CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
-from infrastructure import get_unit_of_work, get_cache, CommonMessages
-from infrastructure.telegram import MessageBuilder
+# Импортируем cache_manager вместо get_cache
+from infrastructure.cache import cache_manager
+from infrastructure import get_unit_of_work
+from core.exceptions import SubscriptionRequiredError
 
 # Настройка логирования
 logger = logging.getLogger(__name__)
+
+
+class CommonMessages:
+    """Общие сообщения для пользователей."""
+    ERROR_GENERIC = "😔 Произошла ошибка. Попробуйте позже или обратитесь в поддержку."
+    SUBSCRIPTION_REQUIRED = "⭐ Эта функция доступна только по подписке.\n\nОформите подписку для доступа ко всем возможностям бота!"
+    RATE_LIMIT_EXCEEDED = "⏳ Слишком много запросов. Попробуйте через несколько секунд."
+    MAINTENANCE = "🔧 Бот находится на техническом обслуживании. Попробуйте позже."
 
 
 class BaseHandler:
@@ -75,7 +86,7 @@ class BaseHandler:
 
         # Сохраняем в кэш для аналитики
         cache_key = f"user_action:{user_id}:{int(time.time())}"
-        await get_cache().set(cache_key, log_data, ttl=86400)  # 24 часа
+        await cache_manager.set(cache_key, log_data, ttl=86400)  # 24 часа
 
     async def check_subscription(
             self,
@@ -86,61 +97,85 @@ class BaseHandler:
         Проверить уровень подписки пользователя.
 
         Args:
-            user_id: ID пользователя
+            user_id: ID пользователя Telegram
             required_level: Требуемый уровень подписки
 
         Returns:
-            True если подписка подходит
+            True если у пользователя есть нужный уровень подписки
         """
-        async with get_unit_of_work() as uow:
-            user = await uow.users.get_by_telegram_id(user_id)
-            if not user:
-                return False
+        try:
+            async with get_unit_of_work() as uow:
+                # Получаем пользователя
+                user = await uow.users.get_by_telegram_id(user_id)
+                if not user:
+                    return False
 
-            subscription = await uow.users.get_active_subscription(user.id)
-            if not subscription:
-                return required_level == "free"
+                # Получаем активную подписку
+                subscription = await uow.subscriptions.get_active_by_user_id(user.id)
+                if not subscription:
+                    return False
 
-            # Проверка уровня подписки
-            levels = ["free", "basic", "premium", "vip"]
-            user_level_index = levels.index(subscription.plan)
-            required_level_index = levels.index(required_level)
+                # Проверяем уровень
+                return subscription.check_access_level(required_level)
 
-            return user_level_index >= required_level_index
+        except Exception as e:
+            logger.error(f"Ошибка проверки подписки: {e}")
+            return False
 
-    async def increment_usage(
+    async def send_typing_action(
             self,
-            user_id: int,
-            feature: str
-    ) -> bool:
+            chat_id: Union[int, str]
+    ) -> None:
         """
-        Увеличить счетчик использования функции.
+        Отправить действие "печатает".
+
+        Args:
+            chat_id: ID чата
+        """
+        try:
+            from aiogram import Bot
+            bot = Bot.get_current()
+            await bot.send_chat_action(chat_id, action="typing")
+        except Exception as e:
+            logger.debug(f"Не удалось отправить typing action: {e}")
+
+    async def get_user_language(self, user_id: int) -> str:
+        """
+        Получить язык пользователя.
 
         Args:
             user_id: ID пользователя
-            feature: Название функции
 
         Returns:
-            True если лимит не превышен
+            Код языка (ru, en и т.д.)
         """
-        async with get_unit_of_work() as uow:
-            user = await uow.users.get_by_telegram_id(user_id)
-            if not user:
-                return False
+        try:
+            # Сначала проверяем кэш
+            cache_key = f"user_lang:{user_id}"
+            cached_lang = await cache_manager.get(cache_key)
+            if cached_lang:
+                return cached_lang
 
-            # Проверяем и увеличиваем счетчик
-            can_use = await uow.users.increment_reading_count(
-                user.id,
-                feature
-            )
+            # Если нет в кэше, получаем из БД
+            async with get_unit_of_work() as uow:
+                user = await uow.users.get_by_telegram_id(user_id)
+                if user and user.language_code:
+                    # Сохраняем в кэш
+                    await cache_manager.set(cache_key, user.language_code, ttl=3600)
+                    return user.language_code
 
-            return can_use
+            return "ru"  # По умолчанию русский
+
+        except Exception as e:
+            logger.error(f"Ошибка получения языка пользователя: {e}")
+            return "ru"
 
 
-# Декораторы для обработчиков
+# Декораторы
+
 def error_handler(send_message: bool = True):
     """
-    Декоратор для обработки ошибок в хендлерах.
+    Декоратор для обработки ошибок в обработчиках.
 
     Args:
         send_message: Отправлять ли сообщение об ошибке пользователю
@@ -148,12 +183,15 @@ def error_handler(send_message: bool = True):
 
     def decorator(func):
         @functools.wraps(func)
-        async def wrapper(self, *args, **kwargs):
+        async def wrapper(*args, **kwargs):
             # Находим объект message или callback_query
             message = None
             callback_query = None
 
-            for arg in args:
+            # self может быть первым аргументом если это метод класса
+            start_index = 1 if args and hasattr(args[0], '__class__') else 0
+
+            for arg in args[start_index:]:
                 if isinstance(arg, types.Message):
                     message = arg
                     break
@@ -163,7 +201,7 @@ def error_handler(send_message: bool = True):
                     break
 
             try:
-                return await func(self, *args, **kwargs)
+                return await func(*args, **kwargs)
 
             except TelegramBadRequest as e:
                 logger.error(f"Telegram API ошибка в {func.__name__}: {e}")
@@ -172,8 +210,18 @@ def error_handler(send_message: bool = True):
                     error_text = "❌ Произошла ошибка при отправке сообщения"
                     if callback_query:
                         await callback_query.answer(error_text, show_alert=True)
-                    else:
+                    elif message:
                         await message.answer(error_text)
+
+            except SubscriptionRequiredError:
+                if send_message and message:
+                    if callback_query:
+                        await callback_query.answer(
+                            "⭐ Требуется подписка",
+                            show_alert=True
+                        )
+                    else:
+                        await message.answer(CommonMessages.SUBSCRIPTION_REQUIRED)
 
             except Exception as e:
                 logger.error(f"Ошибка в {func.__name__}: {e}", exc_info=True)
@@ -185,7 +233,7 @@ def error_handler(send_message: bool = True):
                             "❌ Произошла ошибка",
                             show_alert=True
                         )
-                    else:
+                    elif message:
                         await message.answer(error_text)
 
         return wrapper
@@ -211,6 +259,13 @@ def require_subscription(level: str = "basic"):
 
             if not has_access:
                 await message.answer(CommonMessages.SUBSCRIPTION_REQUIRED)
+                # Можно также предложить оформить подписку
+                from infrastructure.telegram.keyboards import Keyboards
+                keyboard = Keyboards.subscription_offer()
+                await message.answer(
+                    "Выберите подходящий тарифный план:",
+                    reply_markup=keyboard
+                )
                 return
 
             return await func(self, message, *args, **kwargs)
@@ -249,7 +304,7 @@ def log_action(action_name: str):
                 result = await func(self, *args, **kwargs)
 
                 # Логируем успешное выполнение
-                if user_id:
+                if user_id and hasattr(self, 'log_action'):
                     await self.log_action(
                         user_id,
                         action_name,
@@ -263,7 +318,7 @@ def log_action(action_name: str):
 
             except Exception as e:
                 # Логируем ошибку
-                if user_id:
+                if user_id and hasattr(self, 'log_action'):
                     await self.log_action(
                         user_id,
                         action_name,
@@ -311,17 +366,15 @@ def check_rate_limit(max_calls: int = 10, period: int = 60):
 
             # Проверяем rate limit
             cache_key = f"rate_limit:{func.__name__}:{user_id}"
-            current_count = await get_cache().get(cache_key) or 0
+            current_count = await cache_manager.get(cache_key) or 0
 
             if current_count >= max_calls:
                 if message:
-                    await message.answer(
-                        f"⏳ Слишком много запросов. Попробуйте через {period} секунд."
-                    )
+                    await message.answer(CommonMessages.RATE_LIMIT_EXCEEDED)
                 return
 
             # Увеличиваем счетчик
-            await get_cache().set(
+            await cache_manager.set(
                 cache_key,
                 current_count + 1,
                 ttl=period
@@ -335,6 +388,7 @@ def check_rate_limit(max_calls: int = 10, period: int = 60):
 
 
 # Общие функции для обработчиков
+
 async def get_or_create_user(telegram_user: types.User) -> Any:
     """
     Получить или создать пользователя в БД.
@@ -351,13 +405,21 @@ async def get_or_create_user(telegram_user: types.User) -> Any:
 
         if not user:
             # Создаем нового пользователя
-            user = await uow.users.create_or_update_from_telegram(
-                telegram_user.id,
-                telegram_user.username,
-                telegram_user.first_name,
-                telegram_user.last_name,
-                telegram_user.language_code
+            from core.entities import User
+            from datetime import datetime
+
+            user = User(
+                telegram_id=telegram_user.id,
+                username=telegram_user.username,
+                first_name=telegram_user.first_name,
+                last_name=telegram_user.last_name,
+                language_code=telegram_user.language_code or "ru",
+                created_at=datetime.now(),
+                is_active=True
             )
+
+            user = await uow.users.create(user)
+            await uow.commit()
 
         return user
 
@@ -377,15 +439,16 @@ async def answer_callback_query(
     """
     try:
         await callback_query.answer(text, show_alert=show_alert)
-    except TelegramBadRequest:
+    except TelegramBadRequest as e:
         # Callback query уже устарел
-        pass
+        logger.debug(f"Callback query устарел: {e}")
 
 
 async def edit_or_send_message(
         message: types.Message,
         text: str,
         reply_markup: Optional[Any] = None,
+        parse_mode: Optional[str] = None,
         **kwargs
 ) -> types.Message:
     """
@@ -395,6 +458,7 @@ async def edit_or_send_message(
         message: Сообщение
         text: Новый текст
         reply_markup: Клавиатура
+        parse_mode: Режим парсинга
         **kwargs: Дополнительные параметры
 
     Returns:
@@ -405,6 +469,7 @@ async def edit_or_send_message(
         return await message.edit_text(
             text,
             reply_markup=reply_markup,
+            parse_mode=parse_mode,
             **kwargs
         )
     except TelegramBadRequest:
@@ -412,6 +477,7 @@ async def edit_or_send_message(
         return await message.answer(
             text,
             reply_markup=reply_markup,
+            parse_mode=parse_mode,
             **kwargs
         )
 
@@ -433,6 +499,47 @@ async def delete_message_safe(message: types.Message) -> bool:
         return False
 
 
+async def send_long_message(
+        message: types.Message,
+        text: str,
+        parse_mode: Optional[str] = None,
+        chunk_size: int = 4000
+) -> List[types.Message]:
+    """
+    Отправить длинное сообщение, разбив на части.
+
+    Args:
+        message: Исходное сообщение
+        text: Текст для отправки
+        parse_mode: Режим парсинга
+        chunk_size: Размер одного куска
+
+    Returns:
+        Список отправленных сообщений
+    """
+    messages = []
+
+    # Разбиваем текст на части
+    for i in range(0, len(text), chunk_size):
+        chunk = text[i:i + chunk_size]
+
+        # Убеждаемся, что не обрезаем посреди слова
+        if i + chunk_size < len(text) and not text[i + chunk_size].isspace():
+            last_space = chunk.rfind(' ')
+            if last_space > 0:
+                chunk = chunk[:last_space]
+                i -= (chunk_size - last_space)
+
+        sent_message = await message.answer(chunk, parse_mode=parse_mode)
+        messages.append(sent_message)
+
+        # Небольшая задержка между сообщениями
+        if i + chunk_size < len(text):
+            await asyncio.sleep(0.1)
+
+    return messages
+
+
 # Класс для группировки обработчиков
 class HandlerGroup:
     """Группа связанных обработчиков."""
@@ -449,7 +556,7 @@ class HandlerGroup:
         self.prefix = prefix
         self.handlers: List[BaseHandler] = []
 
-    def add_handler(self, handler_class: type) -> None:
+    def add_handler(self, handler_class: Type[BaseHandler]) -> None:
         """Добавить обработчик в группу."""
         handler = handler_class(self.router)
         handler.register_handlers()
@@ -457,12 +564,49 @@ class HandlerGroup:
 
         logger.info(f"Зарегистрирован обработчик {handler.name} в группе {self.prefix}")
 
-    def get_stats(self) -> Dict[str, int]:
+    def get_stats(self) -> Dict[str, Any]:
         """Получить статистику группы."""
         return {
             "total_handlers": len(self.handlers),
-            "handlers": [h.name for h in self.handlers]
+            "handlers": [h.name for h in self.handlers],
+            "prefix": self.prefix
         }
+
+
+# Дополнительные утилиты
+async def is_user_admin(user_id: int) -> bool:
+    """
+    Проверить, является ли пользователь администратором.
+
+    Args:
+        user_id: ID пользователя
+
+    Returns:
+        True если пользователь администратор
+    """
+    from config import settings
+    return user_id in settings.bot.admin_ids
+
+
+async def is_user_blocked_bot(user_id: int) -> bool:
+    """
+    Проверить, заблокировал ли пользователь бота.
+
+    Args:
+        user_id: ID пользователя
+
+    Returns:
+        True если пользователь заблокировал бота
+    """
+    try:
+        from aiogram import Bot
+        bot = Bot.get_current()
+        await bot.send_chat_action(user_id, action="typing")
+        return False
+    except TelegramBadRequest as e:
+        if "chat not found" in str(e).lower():
+            return True
+        return False
 
 
 logger.info("Модуль базовых обработчиков загружен")

@@ -18,18 +18,34 @@ import signal
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
+from dataclasses import dataclass
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.redis import RedisStorage
-from aioredis import Redis
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
+import redis.asyncio as aioredis
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.redis import RedisJobStore
+
+# Добавляем корневую директорию в путь для импортов
+sys.path.insert(0, str(Path(__file__).parent))
 
 # Конфигурация
-from bot.config import Settings, setup_logging
-from bot.config.constants import BotInfo
+from config import settings, logger, setup_logging, get_version
+from config.constants import BotCommands
+
+# Создаем класс BotInfo если его нет
+@dataclass
+class BotInfo:
+    """Информация о боте."""
+    NAME: str = "Астро-Таро Бот"
+    VERSION: str = get_version()
+    DESCRIPTION: str = "Персональный астрологический помощник"
+    AUTHOR: str = "AI Assistant"
 
 # Инфраструктура
 from infrastructure import (
@@ -38,33 +54,36 @@ from infrastructure import (
     get_unit_of_work
 )
 
+# Импортируем cache_manager вместо get_cache
+from infrastructure.cache import cache_manager
+
 # Обработчики и middleware
-from bot.handlers import create_dispatcher
-from bot.middleware import MetricsMiddleware
+from bot.handlers import setup_handlers
+from bot.middleware import setup_middleware
 
 # Сервисы
-from bot.services import (
+from services import (
     get_notification_service,
     get_analytics_service,
     get_user_service
 )
 
-# Утилиты
-from bot.utils import scheduler
-
 # Настройка логирования
+setup_logging()
 logger = logging.getLogger(__name__)
 
 
 class AstroTarotBot:
     """Основной класс бота."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self):
+        """Инициализация бота."""
         self.settings = settings
         self.bot: Optional[Bot] = None
         self.dp: Optional[Dispatcher] = None
-        self.scheduler = None
+        self.scheduler: Optional[AsyncIOScheduler] = None
         self._running = False
+        self._start_time = datetime.now()
 
     async def initialize(self):
         """Инициализация всех компонентов."""
@@ -78,164 +97,149 @@ class AstroTarotBot:
             logger.info("Initializing infrastructure...")
             await init_infrastructure()
 
-            # 2. Проверяем/создаем таблицы БД
+            # 2. Инициализируем кэш
+            logger.info("Initializing cache...")
+            await cache_manager.init()
+
+            # 3. Проверяем/создаем таблицы БД
             await self._init_database()
 
-            # 3. Создаем бота
+            # 4. Создаем бота с правильными параметрами для aiogram 3.3.0
             logger.info("Creating bot instance...")
             self.bot = Bot(
-                token=self.settings.bot_token,
-                default=DefaultBotProperties(
-                    parse_mode=ParseMode.HTML,
-                    link_preview_is_disabled=True
-                )
+                token=self.settings.bot.token.get_secret_value(),
+                parse_mode=ParseMode.HTML
             )
 
-            # 4. Создаем диспетчер с нужным хранилищем
+            # 5. Создаем диспетчер с нужным хранилищем
             logger.info("Creating dispatcher...")
             storage = await self._create_storage()
-            self.dp = create_dispatcher(storage)
+            self.dp = Dispatcher(storage=storage)
 
-            # 5. Настраиваем планировщик задач
+            # 6. Настраиваем обработчики и middleware
+            logger.info("Setting up handlers and middleware...")
+            setup_handlers(self.dp)
+            setup_middleware(self.dp)
+
+            # 7. Настраиваем планировщик задач
             logger.info("Setting up scheduler...")
             self.scheduler = await self._setup_scheduler()
 
-            # 6. Проверяем бота
+            # 8. Проверяем бота
             bot_info = await self.bot.get_me()
             logger.info(f"Bot initialized: @{bot_info.username}")
 
-            # 7. Устанавливаем команды
+            # 9. Уведомляем админов о запуске
+            await self._notify_admins_startup()
+
+            # 10. Устанавливаем команды бота
             await self._set_bot_commands()
 
-            logger.info("Initialization completed successfully!")
+            logger.info("Initialization complete!")
 
         except Exception as e:
-            logger.error(f"Failed to initialize bot: {e}", exc_info=True)
+            logger.error(f"Initialization failed: {e}", exc_info=True)
             raise
-
-    async def start(self):
-        """Запуск бота."""
-        if not self.bot or not self.dp:
-            raise RuntimeError("Bot not initialized. Call initialize() first.")
-
-        self._running = True
-
-        # Запускаем планировщик
-        if self.scheduler:
-            self.scheduler.start()
-            logger.info("Scheduler started")
-
-        # Отправляем уведомление о запуске админам
-        await self._notify_admins_startup()
-
-        # Выбираем режим работы
-        if self.settings.use_webhook:
-            await self._start_webhook()
-        else:
-            await self._start_polling()
-
-    async def stop(self):
-        """Остановка бота."""
-        logger.info("Shutting down bot...")
-        self._running = False
-
-        # Останавливаем планировщик
-        if self.scheduler and self.scheduler.running:
-            self.scheduler.shutdown()
-            logger.info("Scheduler stopped")
-
-        # Отправляем уведомление админам
-        await self._notify_admins_shutdown()
-
-        # Закрываем сессию бота
-        if self.bot:
-            await self.bot.session.close()
-            logger.info("Bot session closed")
-
-        # Закрываем инфраструктуру
-        await shutdown_infrastructure()
-
-        logger.info("Shutdown completed")
 
     async def _init_database(self):
         """Инициализация базы данных."""
-        logger.info("Checking database...")
+        from infrastructure.database import init_database
 
-        # Здесь должна быть миграция БД
-        # Пока просто проверяем подключение
-        async with get_unit_of_work() as uow:
-            user_count = await uow.users.count_total()
-            logger.info(f"Database connected. Users count: {user_count}")
+        try:
+            await init_database()
+            logger.info("Database initialized")
+        except Exception as e:
+            logger.error(f"Database initialization failed: {e}")
+            # В development продолжаем работу даже без БД
+            if self.settings.environment != "development":
+                raise
 
     async def _create_storage(self):
-        """Создание хранилища FSM."""
-        if self.settings.redis_url:
+        """Создание хранилища для FSM."""
+        if self.settings.redis.url:
             try:
-                redis = Redis.from_url(self.settings.redis_url)
+                redis = await aioredis.from_url(
+                    self.settings.redis.url,
+                    encoding="utf-8",
+                    decode_responses=True
+                )
+                # Проверяем подключение
                 await redis.ping()
                 logger.info("Using Redis storage for FSM")
-                return RedisStorage(redis)
+                return RedisStorage(redis=redis)
             except Exception as e:
-                logger.warning(f"Failed to connect to Redis: {e}")
-                logger.info("Falling back to memory storage")
+                logger.warning(f"Redis unavailable, falling back to memory storage: {e}")
 
         logger.info("Using memory storage for FSM")
         return MemoryStorage()
 
-    async def _setup_scheduler(self):
+    async def _setup_scheduler(self) -> AsyncIOScheduler:
         """Настройка планировщика задач."""
-        from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        from apscheduler.jobstores.memory import MemoryJobStore
+        jobstores = {}
 
-        jobstores = {
-            'default': MemoryJobStore()
-        }
+        # Если есть Redis, используем его для хранения задач
+        if self.settings.redis.url:
+            try:
+                jobstores['default'] = RedisJobStore(
+                    host=self.settings.redis.host,
+                    port=self.settings.redis.port,
+                    db=self.settings.redis.db
+                )
+                logger.info("Using Redis jobstore for scheduler")
+            except Exception as e:
+                logger.warning(f"Redis jobstore unavailable: {e}")
 
         scheduler = AsyncIOScheduler(
             jobstores=jobstores,
-            timezone='UTC'
+            timezone=self.settings.default_timezone,
+            job_defaults={
+                'coalesce': True,
+                'max_instances': 3,
+                'misfire_grace_time': 300
+            }
         )
 
         # Добавляем задачи
+        # Ежедневная рассылка гороскопов
+        if self.settings.features.daily_horoscope:
+            scheduler.add_job(
+                self._send_daily_horoscopes,
+                'cron',
+                hour=9,
+                minute=0,
+                id='daily_horoscopes'
+            )
 
-        # 1. Ежедневная отправка гороскопов (9:00 UTC)
-        scheduler.add_job(
-            self._send_daily_horoscopes,
-            'cron',
-            hour=9,
-            minute=0,
-            id='daily_horoscopes'
-        )
-
-        # 2. Проверка истекающих подписок (каждые 6 часов)
+        # Напоминания о продлении подписки
         scheduler.add_job(
             self._check_expiring_subscriptions,
-            'interval',
-            hours=6,
-            id='check_subscriptions'
+            'cron',
+            hour=12,
+            minute=0,
+            id='subscription_reminders'
         )
 
-        # 3. Сбор и отправка статистики (ежедневно в 23:00)
+        # Сбор статистики
         scheduler.add_job(
             self._collect_daily_stats,
             'cron',
             hour=23,
-            minute=0,
+            minute=55,
             id='daily_stats'
         )
 
-        # 4. Очистка старых данных (еженедельно)
+        # Очистка старых данных
         scheduler.add_job(
             self._cleanup_old_data,
             'cron',
-            day_of_week='sun',
             hour=3,
             minute=0,
+            day_of_week=0,  # Понедельник
             id='weekly_cleanup'
         )
 
-        # 5. Резервное копирование (ежедневно в 2:00)
-        if self.settings.enable_backups:
+        # Резервное копирование (ежедневно в 2:00)
+        if self.settings.features.enable_backups:
             scheduler.add_job(
                 self._backup_database,
                 'cron',
@@ -244,6 +248,7 @@ class AstroTarotBot:
                 id='daily_backup'
             )
 
+        scheduler.start()
         logger.info(f"Scheduler configured with {len(scheduler.get_jobs())} jobs")
         return scheduler
 
@@ -271,6 +276,25 @@ class AstroTarotBot:
 
         logger.info("Bot commands set")
 
+    async def start(self):
+        """Запуск бота."""
+        await self.initialize()
+        self._running = True
+
+        # Настраиваем обработчики сигналов
+        self._setup_signal_handlers()
+
+        try:
+            if self.settings.bot.use_webhook:
+                await self._start_webhook()
+            else:
+                await self._start_polling()
+        except Exception as e:
+            logger.error(f"Bot start failed: {e}", exc_info=True)
+            raise
+        finally:
+            await self.shutdown()
+
     async def _start_polling(self):
         """Запуск бота в режиме polling."""
         logger.info("Starting bot in polling mode...")
@@ -290,16 +314,86 @@ class AstroTarotBot:
         logger.info("Starting bot in webhook mode...")
 
         # Устанавливаем webhook
-        webhook_url = f"{self.settings.webhook_url}/webhook/{self.settings.bot_token}"
+        webhook_url = f"{self.settings.bot.webhook_url}/webhook/{self.settings.bot.token.get_secret_value()}"
         await self.bot.set_webhook(
             url=webhook_url,
             drop_pending_updates=True,
-            secret_token=self.settings.webhook_secret
+            secret_token=self.settings.bot.webhook_secret
         )
 
-        # Здесь должен быть запуск web-сервера
-        # Например, с использованием aiohttp или FastAPI
-        logger.info(f"Webhook set: {webhook_url}")
+        # Создаем приложение
+        app = web.Application()
+
+        # Настраиваем обработчик webhook
+        webhook_handler = SimpleRequestHandler(
+            dispatcher=self.dp,
+            bot=self.bot,
+            secret_token=self.settings.bot.webhook_secret
+        )
+
+        webhook_handler.register(app, path=f"/webhook/{self.settings.bot.token.get_secret_value()}")
+        setup_application(app, self.dp, bot=self.bot)
+
+        # Запускаем web-сервер
+        runner = web.AppRunner(app)
+        await runner.setup()
+
+        site = web.TCPSite(
+            runner,
+            host=self.settings.bot.webapp_host,
+            port=self.settings.bot.webapp_port
+        )
+
+        await site.start()
+        logger.info(f"Webhook server started on {self.settings.bot.webapp_host}:{self.settings.bot.webapp_port}")
+
+        # Держим сервер запущенным
+        while self._running:
+            await asyncio.sleep(1)
+
+    def _setup_signal_handlers(self):
+        """Настройка обработчиков сигналов."""
+        def signal_handler(sig, frame):
+            logger.info(f"Received signal {sig}")
+            asyncio.create_task(self.shutdown())
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+    async def shutdown(self):
+        """Корректное завершение работы."""
+        if not self._running:
+            return
+
+        self._running = False
+        logger.info("Shutting down bot...")
+
+        try:
+            # Уведомляем админов
+            await self._notify_admins_shutdown()
+
+            # Останавливаем планировщик
+            if self.scheduler:
+                self.scheduler.shutdown()
+
+            # Закрываем webhook
+            if self.settings.bot.use_webhook:
+                await self.bot.delete_webhook()
+
+            # Закрываем бота
+            if self.bot:
+                await self.bot.session.close()
+
+            # Закрываем кэш
+            await cache_manager.close()
+
+            # Закрываем инфраструктуру
+            await shutdown_infrastructure()
+
+            logger.info("Bot shutdown complete")
+
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
 
     # Задачи планировщика
 
@@ -308,54 +402,18 @@ class AstroTarotBot:
         logger.info("Sending daily horoscopes...")
 
         notification_service = get_notification_service()
+        sent_count = await notification_service.send_daily_horoscopes()
 
-        async with get_unit_of_work() as uow:
-            # Получаем пользователей с включенными уведомлениями
-            users = await uow.users.get_for_daily_notifications()
-
-            sent_count = 0
-            for user in users:
-                if user.zodiac_sign:
-                    success = await notification_service.send_notification(
-                        user.id,
-                        "daily_horoscope",
-                        {"zodiac_sign": user.zodiac_sign},
-                        self.bot
-                    )
-                    if success:
-                        sent_count += 1
-
-                    # Небольшая задержка между отправками
-                    await asyncio.sleep(0.1)
-
-            logger.info(f"Daily horoscopes sent: {sent_count}/{len(users)}")
+        logger.info(f"Daily horoscopes sent to {sent_count} users")
 
     async def _check_expiring_subscriptions(self):
         """Проверка истекающих подписок."""
         logger.info("Checking expiring subscriptions...")
 
         notification_service = get_notification_service()
+        reminded_count = await notification_service.send_subscription_reminders()
 
-        async with get_unit_of_work() as uow:
-            # Подписки, истекающие через 3 дня
-            expiring = await uow.subscriptions.get_expiring(days=3)
-
-            for subscription in expiring:
-                if not subscription.notified_expiring:
-                    await notification_service.send_notification(
-                        subscription.user_id,
-                        "subscription_expiring",
-                        {
-                            "days_left": 3,
-                            "plan": subscription.plan_name
-                        },
-                        self.bot
-                    )
-
-                    subscription.notified_expiring = True
-                    await uow.commit()
-
-            logger.info(f"Processed {len(expiring)} expiring subscriptions")
+        logger.info(f"Subscription reminders sent to {reminded_count} users")
 
     async def _collect_daily_stats(self):
         """Сбор ежедневной статистики."""
@@ -386,9 +444,7 @@ class AstroTarotBot:
             archived_users = await uow.users.archive_inactive(days=180)
 
             # Очищаем кэш
-            from infrastructure.cache import get_cache
-            cache = await get_cache()
-            await cache.clear_expired()
+            await cache_manager.clear()
 
             await uow.commit()
 
@@ -425,152 +481,126 @@ class AstroTarotBot:
 
     async def _notify_admins_startup(self):
         """Уведомление админов о запуске."""
-        async with get_unit_of_work() as uow:
-            admins = await uow.users.get_admins()
+        if not self.bot:
+            return
 
-            message = (
-                f"🚀 <b>{BotInfo.NAME} запущен!</b>\n\n"
-                f"Версия: {BotInfo.VERSION}\n"
-                f"Окружение: {self.settings.environment}\n"
-                f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
+        admin_ids = self.settings.bot.admin_ids
 
-            for admin in admins:
-                try:
-                    await self.bot.send_message(
-                        admin.telegram_id,
-                        message,
-                        parse_mode="HTML"
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to notify admin {admin.id}: {e}")
+        message = (
+            f"🚀 <b>{BotInfo.NAME} запущен!</b>\n\n"
+            f"Версия: {BotInfo.VERSION}\n"
+            f"Окружение: {self.settings.environment}\n"
+            f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        for admin_id in admin_ids:
+            try:
+                await self.bot.send_message(admin_id, message)
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin_id}: {e}")
 
     async def _notify_admins_shutdown(self):
         """Уведомление админов об остановке."""
-        async with get_unit_of_work() as uow:
-            admins = await uow.users.get_admins()
+        if not self.bot:
+            return
 
-            message = (
-                f"🛑 <b>{BotInfo.NAME} остановлен</b>\n\n"
-                f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
+        admin_ids = self.settings.bot.admin_ids
 
-            for admin in admins:
-                try:
-                    await self.bot.send_message(
-                        admin.telegram_id,
-                        message,
-                        parse_mode="HTML"
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to notify admin {admin.id}: {e}")
+        message = (
+            f"🛑 <b>{BotInfo.NAME} остановлен</b>\n\n"
+            f"Время работы: {self._get_uptime()}\n"
+            f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        for admin_id in admin_ids:
+            try:
+                await self.bot.send_message(admin_id, message)
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin_id}: {e}")
 
     async def _notify_admins_error(self, error_type: str, error_message: str):
         """Уведомление админов об ошибке."""
-        async with get_unit_of_work() as uow:
-            admins = await uow.users.get_admins()
+        if not self.bot:
+            return
 
-            message = (
-                f"🚨 <b>Ошибка в боте!</b>\n\n"
-                f"Тип: {error_type}\n"
-                f"Сообщение: {error_message}\n"
-                f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
+        admin_ids = self.settings.bot.admin_ids
 
-            for admin in admins:
-                try:
-                    await self.bot.send_message(
-                        admin.telegram_id,
-                        message,
-                        parse_mode="HTML"
-                    )
-                except:
-                    pass
-
-    async def _send_stats_to_admins(self, stats: dict):
-        """Отправка статистики админам."""
-        analytics_service = get_analytics_service()
-
-        # Форматируем статистику
         message = (
-            f"📊 <b>Ежедневная статистика</b>\n\n"
-            f"<b>Пользователи:</b>\n"
-            f"• Всего: {stats['users']['total']}\n"
-            f"• Активных сегодня: {stats['users']['active_today']}\n"
-            f"• Активных за неделю: {stats['users']['active_week']}\n\n"
-            f"<b>Подписки:</b>\n"
-            f"• Активных: {stats['subscriptions']['total_active']}\n"
-            f"• Конверсия: {stats['subscriptions']['conversion_rate']:.1f}%\n\n"
-            f"<b>Использование:</b>\n"
-            f"• Раскладов: {stats['usage']['total_spreads']}\n"
-            f"• Гороскопов: {stats['usage']['total_horoscopes']}\n\n"
-            f"<b>Финансы:</b>\n"
-            f"• Доход сегодня: {stats['revenue']['today']:.0f} ₽\n"
-            f"• Доход за месяц: {stats['revenue']['month']:.0f} ₽\n"
-            f"• ARPU: {stats['revenue']['arpu']:.0f} ₽"
+            f"❌ <b>Ошибка в {BotInfo.NAME}</b>\n\n"
+            f"Тип: {error_type}\n"
+            f"Сообщение: {error_message}\n"
+            f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
-        async with get_unit_of_work() as uow:
-            admins = await uow.users.get_admins()
+        for admin_id in admin_ids:
+            try:
+                await self.bot.send_message(admin_id, message)
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin_id}: {e}")
 
-            for admin in admins:
-                try:
-                    await self.bot.send_message(
-                        admin.telegram_id,
-                        message,
-                        parse_mode="HTML"
-                    )
-                except:
-                    pass
+    async def _send_stats_to_admins(self, stats: Dict[str, Any]):
+        """Отправка статистики админам."""
+        if not self.bot:
+            return
+
+        admin_ids = self.settings.bot.admin_ids
+
+        message = (
+            f"📊 <b>Ежедневная статистика</b>\n\n"
+            f"👥 Активных пользователей: {stats.get('active_users', 0)}\n"
+            f"📝 Сообщений обработано: {stats.get('messages_processed', 0)}\n"
+            f"🎴 Раскладов выполнено: {stats.get('tarot_readings', 0)}\n"
+            f"⭐ Гороскопов просмотрено: {stats.get('horoscopes_viewed', 0)}\n"
+            f"💎 Новых подписок: {stats.get('new_subscriptions', 0)}\n"
+            f"💰 Доход за день: {stats.get('daily_revenue', 0)} ₽"
+        )
+
+        for admin_id in admin_ids:
+            try:
+                await self.bot.send_message(admin_id, message)
+            except Exception as e:
+                logger.error(f"Failed to send stats to admin {admin_id}: {e}")
+
+    def _get_uptime(self) -> str:
+        """Получить время работы бота."""
+        uptime = datetime.now() - self._start_time
+        days = uptime.days
+        hours, remainder = divmod(uptime.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        parts = []
+        if days > 0:
+            parts.append(f"{days} дн.")
+        if hours > 0:
+            parts.append(f"{hours} ч.")
+        if minutes > 0:
+            parts.append(f"{minutes} мин.")
+        if seconds > 0 or not parts:
+            parts.append(f"{seconds} сек.")
+
+        return " ".join(parts)
 
 
+# Точка входа
 async def main():
     """Главная функция запуска."""
-    # Настройка логирования
-    setup_logging()
-
-    # Загрузка настроек
-    settings = Settings()
-
-    # Создание и инициализация бота
-    bot = AstroTarotBot(settings)
+    bot = AstroTarotBot()
 
     try:
-        # Инициализация
-        await bot.initialize()
-
-        # Обработка сигналов для graceful shutdown
-        loop = asyncio.get_event_loop()
-
-        def signal_handler(sig, frame):
-            logger.info(f"Received signal {sig}")
-            asyncio.create_task(bot.stop())
-            sys.exit(0)
-
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-
-        # Запуск бота
-        logger.info("Starting bot...")
         await bot.start()
-
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        await bot.stop()
-        sys.exit(1)
+        logger.error(f"Bot crashed: {e}", exc_info=True)
+    finally:
+        await bot.shutdown()
 
 
 if __name__ == "__main__":
-    # Проверка версии Python
-    if sys.version_info < (3, 10):
-        print("Error: Python 3.10+ is required")
-        sys.exit(1)
-
-    # Запуск
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
+        logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
