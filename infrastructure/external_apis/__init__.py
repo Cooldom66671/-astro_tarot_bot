@@ -9,6 +9,7 @@
 """
 
 from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta
 
 from config import logger
 
@@ -446,8 +447,6 @@ logger.info("Модуль external_apis инициализирован")
 
 # Проверка доступности провайдеров при старте
 try:
-    from datetime import datetime
-
     available_providers = []
     for provider in LLMProvider:
         if provider in llm_manager.providers:

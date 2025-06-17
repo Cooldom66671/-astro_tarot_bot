@@ -25,13 +25,24 @@ import logging.handlers
 import sys
 import json
 import re
+import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Callable
 from functools import lru_cache
 
-# Импортируем настройки (будет создан позже)
-from config.settings import settings
+# Проверяем наличие настроек
+try:
+    from config.settings import settings
+except ImportError:
+    # Создаем заглушку для разработки
+    class Settings:
+        environment = "development"
+        debug = True
+        log_level = "INFO"
+        log_file = Path("logs/bot.log")
+        logs_dir = Path("logs")
+    settings = Settings()
 
 
 # Цвета для консольного вывода
@@ -63,7 +74,7 @@ class SensitiveDataFilter(logging.Filter):
     # Паттерны для поиска чувствительных данных
     PATTERNS = [
         # Telegram токены
-        (r'(\d{8,10}:[a-zA-Z0-9_-]{35})', 'TELEGRAM_TOKEN'),
+        (r'(\d{8,10}:[a-zA-Z0-9_-]{35})', '***TELEGRAM_TOKEN***'),
         # API ключи (общий паттерн)
         (r'(api[_-]?key["\']?\s*[:=]\s*["\']?)([a-zA-Z0-9_-]{20,})', r'\1***API_KEY***'),
         # Пароли
@@ -75,6 +86,10 @@ class SensitiveDataFilter(logging.Filter):
         (r'(\+?\d{1,3}[-.\s]?)?\d{3,4}[-.\s]?\d{3,4}[-.\s]?\d{3,4}', '***PHONE***'),
         # Номера карт
         (r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b', '****-****-****-****'),
+        # JWT токены
+        (r'(Bearer\s+)([a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)', r'\1***JWT_TOKEN***'),
+        # UUID
+        (r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', '***UUID***'),
     ]
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -97,22 +112,22 @@ class SensitiveDataFilter(logging.Filter):
             if callable(replacement):
                 text = re.sub(pattern, replacement, text)
             else:
-                text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+                text = re.sub(pattern, replacement, text)
         return text
 
 
 class ColoredFormatter(logging.Formatter):
     """
-    Форматтер с цветным выводом для консоли.
+    Форматтер с цветным выводом для разработки.
 
-    Использует ANSI цвета для выделения уровней логирования
-    и важных частей сообщения.
+    Раскрашивает сообщения в зависимости от уровня логирования
+    для удобного чтения в консоли.
     """
 
-    # Цвета для разных уровней логирования
-    LEVEL_COLORS = {
+    # Маппинг уровней на цвета
+    COLORS_MAP = {
         'DEBUG': Colors.GRAY,
-        'INFO': Colors.GREEN,
+        'INFO': Colors.BLUE,
         'WARNING': Colors.YELLOW,
         'ERROR': Colors.RED,
         'CRITICAL': Colors.RED + Colors.BOLD,
@@ -120,42 +135,31 @@ class ColoredFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         """Форматирует запись с цветами."""
-        # Сохраняем оригинальный формат
-        original_format = self._style._fmt
+        # Получаем базовый формат
+        log_fmt = super().format(record)
 
-        # Получаем цвет для уровня
-        level_color = self.LEVEL_COLORS.get(record.levelname, Colors.WHITE)
+        # Добавляем цвет для уровня
+        levelname = record.levelname
+        if levelname in self.COLORS_MAP:
+            color = self.COLORS_MAP[levelname]
+            # Раскрашиваем уровень
+            colored_levelname = f"{color}{levelname}{Colors.RESET}"
+            log_fmt = log_fmt.replace(levelname, colored_levelname)
 
-        # Форматируем время
-        time_str = Colors.GRAY + '%(asctime)s' + Colors.RESET
+            # Раскрашиваем сообщение для ошибок
+            if levelname in ['ERROR', 'CRITICAL']:
+                # Находим начало сообщения после разделителя
+                parts = log_fmt.split(' | ')
+                if len(parts) >= 4:
+                    parts[-1] = f"{color}{parts[-1]}{Colors.RESET}"
+                    log_fmt = ' | '.join(parts)
 
-        # Форматируем уровень с цветом
-        level_str = level_color + '%(levelname)-8s' + Colors.RESET
-
-        # Форматируем имя модуля
-        name_str = Colors.CYAN + '%(name)s' + Colors.RESET
-
-        # Форматируем сообщение
-        if record.levelname in ['ERROR', 'CRITICAL']:
-            msg_str = level_color + '%(message)s' + Colors.RESET
-        else:
-            msg_str = '%(message)s'
-
-        # Собираем новый формат
-        self._style._fmt = f'{time_str} | {level_str} | {name_str} | {msg_str}'
-
-        # Форматируем запись
-        result = super().format(record)
-
-        # Восстанавливаем оригинальный формат
-        self._style._fmt = original_format
-
-        return result
+        return log_fmt
 
 
 class JSONFormatter(logging.Formatter):
     """
-    Форматтер для вывода логов в JSON формате.
+    JSON форматтер для структурированного логирования.
 
     Используется в production для структурированного логирования,
     которое легко парсить и анализировать.
@@ -171,7 +175,7 @@ class JSONFormatter(logging.Formatter):
             'function': record.funcName,
             'line': record.lineno,
             'message': record.getMessage(),
-            'environment': settings.environment,
+            'environment': getattr(settings, 'environment', 'unknown'),
         }
 
         # Добавляем exception info если есть
@@ -184,10 +188,17 @@ class JSONFormatter(logging.Formatter):
                            'funcName', 'levelname', 'levelno', 'lineno',
                            'module', 'msecs', 'pathname', 'process',
                            'processName', 'relativeCreated', 'thread',
-                           'threadName', 'exc_info', 'exc_text', 'stack_info']:
-                log_data[key] = value
+                           'threadName', 'exc_info', 'exc_text', 'stack_info',
+                           'getMessage']:
+                try:
+                    # Пытаемся сериализовать в JSON
+                    json.dumps(value)
+                    log_data[key] = value
+                except (TypeError, ValueError):
+                    # Если не получается, преобразуем в строку
+                    log_data[key] = str(value)
 
-        return json.dumps(log_data, ensure_ascii=False)
+        return json.dumps(log_data, ensure_ascii=False, default=str)
 
 
 class TelegramHandler(logging.Handler):
@@ -206,53 +217,86 @@ class TelegramHandler(logging.Handler):
             admin_chat_id: ID чата администратора в Telegram
         """
         super().__init__()
-        self.admin_chat_id = admin_chat_id
+        self.admin_chat_id = admin_chat_id or getattr(settings, 'developer_id', None)
         self._bot = None  # Будет инициализирован позже
+        self._queue = asyncio.Queue(maxsize=100)
+        self._task = None
 
-    async def emit_async(self, record: logging.LogRecord) -> None:
-        """Асинхронная отправка сообщения в Telegram."""
-        if not self.admin_chat_id or not self._bot:
+    def set_bot(self, bot) -> None:
+        """Устанавливает экземпляр бота для отправки сообщений."""
+        self._bot = bot
+        # Запускаем обработчик очереди
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._process_queue())
+
+    async def _process_queue(self) -> None:
+        """Обрабатывает очередь сообщений."""
+        while True:
+            try:
+                record = await self._queue.get()
+                await self._send_to_telegram(record)
+            except Exception as e:
+                # Логируем ошибку в stderr чтобы избежать рекурсии
+                print(f"Error in TelegramHandler: {e}", file=sys.stderr)
+
+    async def _send_to_telegram(self, record: logging.LogRecord) -> None:
+        """Отправляет сообщение в Telegram."""
+        if not self._bot or not self.admin_chat_id:
             return
 
         try:
-            # Форматируем сообщение для Telegram
-            message = f"""
-🚨 <b>{record.levelname}</b> в {record.name}
-
-<b>Время:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-<b>Модуль:</b> {record.module}:{record.lineno}
-<b>Функция:</b> {record.funcName}
-
-<b>Сообщение:</b>
-<code>{record.getMessage()[:3000]}</code>
-"""
-
-            # Добавляем traceback если есть
-            if record.exc_info:
-                exc_text = self.format(record)[-1000:]  # Последние 1000 символов
-                message += f"\n<b>Traceback:</b>\n<pre>{exc_text}</pre>"
+            # Форматируем сообщение
+            message = self._format_telegram_message(record)
 
             # Отправляем сообщение
             await self._bot.send_message(
                 chat_id=self.admin_chat_id,
                 text=message,
-                parse_mode="HTML"
+                parse_mode='HTML',
+                disable_notification=False
             )
-
         except Exception as e:
-            # Логируем ошибку отправки в stderr
-            sys.stderr.write(f"Failed to send log to Telegram: {e}\n")
+            # Логируем ошибку в stderr
+            print(f"Failed to send log to Telegram: {e}", file=sys.stderr)
+
+    def _format_telegram_message(self, record: logging.LogRecord) -> str:
+        """Форматирует сообщение для Telegram."""
+        # Эмодзи для уровней
+        emoji_map = {
+            'ERROR': '❌',
+            'CRITICAL': '🚨'
+        }
+        emoji = emoji_map.get(record.levelname, '⚠️')
+
+        # Форматируем сообщение
+        message = (
+            f"{emoji} <b>{record.levelname}</b>\n\n"
+            f"<b>Время:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"<b>Модуль:</b> <code>{record.name}</code>\n"
+            f"<b>Функция:</b> <code>{record.funcName}:{record.lineno}</code>\n\n"
+            f"<b>Сообщение:</b>\n{record.getMessage()[:1000]}"
+        )
+
+        # Добавляем информацию об исключении
+        if record.exc_info:
+            exc_text = self.format(record)[-1000:]  # Последние 1000 символов
+            message += f"\n\n<b>Исключение:</b>\n<pre>{exc_text}</pre>"
+
+        return message
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Синхронная обертка для emit."""
-        # В синхронном контексте просто пропускаем
-        # Реальная отправка будет в async версии
-        pass
+        """Обрабатывает запись лога."""
+        # Добавляем в очередь для асинхронной отправки
+        try:
+            self._queue.put_nowait(record)
+        except asyncio.QueueFull:
+            # Если очередь полная, пропускаем
+            pass
 
 
 def setup_logging() -> None:
     """
-    Настраивает систему логирования для всего приложения.
+    Настраивает систему логирования для приложения.
 
     Конфигурирует:
     - Консольный вывод с цветами для разработки
@@ -262,7 +306,7 @@ def setup_logging() -> None:
     """
     # Получаем корневой logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, settings.log_level))
+    root_logger.setLevel(getattr(logging, getattr(settings, 'log_level', 'INFO')))
 
     # Удаляем существующие handlers
     root_logger.handlers = []
@@ -272,9 +316,9 @@ def setup_logging() -> None:
 
     # 1. Консольный handler
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG if settings.debug else logging.INFO)
+    console_handler.setLevel(logging.DEBUG if getattr(settings, 'debug', False) else logging.INFO)
 
-    if settings.environment == "development":
+    if getattr(settings, 'environment', 'development') == "development":
         # Цветной формат для разработки
         console_formatter = ColoredFormatter(
             '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
@@ -289,11 +333,13 @@ def setup_logging() -> None:
     root_logger.addHandler(console_handler)
 
     # 2. Файловый handler с ротацией по размеру
-    if settings.log_file:
-        settings.log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file = getattr(settings, 'log_file', Path("logs/bot.log"))
+    if log_file:
+        log_file = Path(log_file)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
 
         file_handler = logging.handlers.RotatingFileHandler(
-            filename=str(settings.log_file),
+            filename=str(log_file),
             maxBytes=10 * 1024 * 1024,  # 10 MB
             backupCount=5,
             encoding='utf-8'
@@ -307,7 +353,10 @@ def setup_logging() -> None:
         root_logger.addHandler(file_handler)
 
     # 3. Handler для ошибок с ротацией по времени
-    error_log_file = settings.logs_dir / "errors.log"
+    logs_dir = getattr(settings, 'logs_dir', Path("logs"))
+    error_log_file = Path(logs_dir) / "errors.log"
+    error_log_file.parent.mkdir(parents=True, exist_ok=True)
+
     error_handler = logging.handlers.TimedRotatingFileHandler(
         filename=str(error_log_file),
         when='midnight',
@@ -321,26 +370,33 @@ def setup_logging() -> None:
     root_logger.addHandler(error_handler)
 
     # 4. Telegram handler для критических ошибок (будет настроен позже)
-    # telegram_handler = TelegramHandler()
-    # telegram_handler.setLevel(logging.CRITICAL)
-    # root_logger.addHandler(telegram_handler)
+    if getattr(settings, 'environment', 'development') == "production":
+        telegram_handler = TelegramHandler()
+        telegram_handler.setLevel(logging.CRITICAL)
+        telegram_handler.addFilter(sensitive_filter)
+        root_logger.addHandler(telegram_handler)
 
     # Настройка логирования для сторонних библиотек
     logging.getLogger('aiogram').setLevel(logging.INFO)
     logging.getLogger('asyncio').setLevel(logging.WARNING)
-    logging.getLogger('sqlalchemy.engine').setLevel(
-        logging.INFO if settings.database.echo else logging.WARNING
-    )
+
+    # Для SQLAlchemy
+    if hasattr(settings, 'database') and hasattr(settings.database, 'echo'):
+        logging.getLogger('sqlalchemy.engine').setLevel(
+            logging.INFO if settings.database.echo else logging.WARNING
+        )
+    else:
+        logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
 
     # Отключаем дебаг логи от некоторых библиотек
-    for logger_name in ['urllib3', 'httpx', 'httpcore']:
+    for logger_name in ['urllib3', 'httpx', 'httpcore', 'aiohttp']:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
     # Логируем успешную настройку
     logger = logging.getLogger(__name__)
     logger.info(
-        f"Логирование настроено для окружения '{settings.environment}' "
-        f"с уровнем '{settings.log_level}'"
+        f"Логирование настроено для окружения '{getattr(settings, 'environment', 'unknown')}' "
+        f"с уровнем '{getattr(settings, 'log_level', 'INFO')}'"
     )
 
 
@@ -390,13 +446,40 @@ def log_error(logger: logging.Logger, error: Exception, **kwargs) -> None:
     )
 
 
+def log_performance(logger: logging.Logger, operation: str, duration: float, **kwargs) -> None:
+    """
+    Логирует метрики производительности.
+
+    Args:
+        logger: Logger для записи
+        operation: Название операции
+        duration: Длительность в секундах
+        **kwargs: Дополнительные метрики
+    """
+    logger.info(
+        f"Performance: {operation} completed in {duration:.3f}s",
+        extra={
+            'metric_type': 'performance',
+            'operation': operation,
+            'duration_seconds': duration,
+            'metrics': kwargs
+        }
+    )
+
+
+# Создаем глобальный telegram handler для использования в других модулях
+telegram_handler = TelegramHandler()
+
+
 __all__ = [
     "setup_logging",
     "get_logger",
     "log_event",
     "log_error",
+    "log_performance",
     "SensitiveDataFilter",
     "ColoredFormatter",
     "JSONFormatter",
     "TelegramHandler",
+    "telegram_handler",
 ]

@@ -15,12 +15,11 @@ import time
 import json
 from abc import ABC, abstractmethod
 from typing import (
-    Optional, Dict, Any, Type, TypeVar, List,
-    Callable, Union, Tuple
+    Optional, Dict, Any, TypeVar, List,
+    Union, Tuple
 )
 from datetime import datetime, timedelta
 from enum import Enum
-from functools import wraps
 import hashlib
 
 import aiohttp
@@ -273,13 +272,7 @@ class BaseAPIClient(ABC):
             )
         return self._session
 
-    @backoff.on_exception(
-        backoff.expo,
-        (aiohttp.ClientError, asyncio.TimeoutError),
-        max_tries=3,
-        max_time=60
-    )
-    async def _make_request(
+    async def _make_request_with_retry(
             self,
             method: RequestMethod,
             endpoint: str,
@@ -290,24 +283,7 @@ class BaseAPIClient(ABC):
             use_cache: bool = True
     ) -> Any:
         """
-        Выполнение HTTP запроса с retry и обработкой ошибок.
-
-        Args:
-            method: HTTP метод
-            endpoint: Endpoint (без base_url)
-            params: Query параметры
-            json_data: JSON данные для отправки
-            data: Данные для отправки (не JSON)
-            headers: Дополнительные заголовки
-            use_cache: Использовать кэш
-
-        Returns:
-            Ответ API
-
-        Raises:
-            ExternalAPIError: При ошибке API
-            APITimeoutError: При таймауте
-            RateLimitExceededError: При превышении rate limit
+        Внутренний метод для выполнения запроса с retry.
         """
         # Проверки перед запросом
         self._check_rate_limit()
@@ -420,6 +396,41 @@ class BaseAPIClient(ABC):
             self._on_request_failure()
             logger.error(f"Unexpected error in {self.name}: {e}")
             raise
+
+    async def _make_request(
+            self,
+            method: RequestMethod,
+            endpoint: str,
+            params: Optional[Dict[str, Any]] = None,
+            json_data: Optional[Dict[str, Any]] = None,
+            data: Optional[Any] = None,
+            headers: Optional[Dict[str, str]] = None,
+            use_cache: bool = True
+    ) -> Any:
+        """
+        Выполнение HTTP запроса с retry и обработкой ошибок.
+
+        Использует backoff для автоматических повторных попыток.
+        """
+        # Создаем функцию с правильной сигнатурой для backoff
+        @backoff.on_exception(
+            backoff.expo,
+            (aiohttp.ClientError, asyncio.TimeoutError),
+            max_tries=self.max_retries,
+            max_time=60
+        )
+        async def _request_with_backoff():
+            return await self._make_request_with_retry(
+                method=method,
+                endpoint=endpoint,
+                params=params,
+                json_data=json_data,
+                data=data,
+                headers=headers,
+                use_cache=use_cache
+            )
+
+        return await _request_with_backoff()
 
     # Удобные методы
 

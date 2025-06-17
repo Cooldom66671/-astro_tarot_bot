@@ -19,11 +19,12 @@ from typing import List, Dict, Any, Optional, Tuple
 from decimal import Decimal
 import asyncio
 import random
+import string
 from abc import ABC, abstractmethod
 
 from infrastructure import get_unit_of_work
-from infrastructure.external_apis import get_llm_manager
-from infrastructure.cache import get_cache
+from infrastructure.external_apis import llm_manager, interpret_tarot_cards, analyze_birth_chart, generate_text
+from infrastructure.cache import cache_manager, cache_get, cache_set, cache_delete
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +34,6 @@ class BaseService(ABC):
 
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
-        self._cache = None
-
-    @property
-    async def cache(self):
-        """Ленивая инициализация кэша."""
-        if self._cache is None:
-            self._cache = await get_cache()
-        return self._cache
 
     async def log_action(
             self,
@@ -87,7 +80,7 @@ class TarotService(BaseService):
         """Получить информацию о карте."""
         # Проверяем кэш
         cache_key = f"tarot:card:{card_id}"
-        cached = await (await self.cache).get(cache_key)
+        cached = await cache_get(cache_key)
         if cached:
             return cached
 
@@ -98,7 +91,7 @@ class TarotService(BaseService):
             card_info = self._generate_minor_arcana(card_id)
 
         # Кэшируем
-        await (await self.cache).set(cache_key, card_info, expire=3600)
+        await cache_set(cache_key, card_info, ttl=3600)
 
         return card_info
 
@@ -384,9 +377,9 @@ class TarotService(BaseService):
         Учитывай положение карты (прямое/перевернутое).
         """
 
-        llm = await get_llm_manager()
-        interpretation = await llm.generate_completion(
+        interpretation = await generate_text(
             prompt,
+            context="tarot_interpretation",
             temperature=0.7,
             max_tokens=200
         )
@@ -432,9 +425,9 @@ class TarotService(BaseService):
         Ответ должен быть 5-7 предложений.
         """
 
-        llm = await get_llm_manager()
-        interpretation = await llm.generate_completion(
+        interpretation = await generate_text(
             prompt,
+            context="tarot_spread",
             temperature=0.7,
             max_tokens=400
         )
@@ -503,7 +496,7 @@ class AstrologyService(BaseService):
         """Генерировать гороскоп."""
         # Проверяем кэш
         cache_key = f"horoscope:{zodiac_sign}:{period_type}:{date.today()}"
-        cached = await (await self.cache).get(cache_key)
+        cached = await cache_get(cache_key)
         if cached:
             return cached
 
@@ -529,7 +522,7 @@ class AstrologyService(BaseService):
         })
 
         # Кэшируем на сутки
-        await (await self.cache).set(cache_key, horoscope_data, expire=86400)
+        await cache_set(cache_key, horoscope_data, ttl=86400)
 
         # Сохраняем в историю если есть пользователь
         if user_id:
@@ -846,9 +839,9 @@ class AstrologyService(BaseService):
         Стиль: позитивный, конкретный, с практическими советами.
         """
 
-        llm = await get_llm_manager()
-        response = await llm.generate_completion(
+        response = await generate_text(
             prompt,
+            context="horoscope",
             temperature=0.8,
             max_tokens=500
         )
@@ -882,9 +875,9 @@ class AstrologyService(BaseService):
         Будь позитивным и дай практические советы.
         """
 
-        llm = await get_llm_manager()
-        analysis = await llm.generate_completion(
+        analysis = await generate_text(
             prompt,
+            context="compatibility",
             temperature=0.7,
             max_tokens=300
         )
@@ -1410,7 +1403,8 @@ class NotificationService(BaseService):
             data: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Форматировать уведомление."""
-        from infrastructure.telegram import Keyboards, MessageBuilder, MessageStyle
+        from infrastructure.telegram import Keyboards
+        from infrastructure.telegram.messages import MessageBuilder, MessageStyle
 
         builder = MessageBuilder(MessageStyle.HTML)
 
@@ -1488,7 +1482,7 @@ class UserService(BaseService):
             # Обрабатываем реферальный код
             referrer = None
             if referrer_code:
-                referrer = await uow.users.get_by_referral_code(referrer_code)
+                referrer = await uow.users.get_by_field("referral_code", referrer_code)
                 if referrer:
                     user_data["referred_by"] = referrer.id
 
@@ -1644,9 +1638,6 @@ class UserService(BaseService):
 
     async def _generate_referral_code(self, user_id: int) -> str:
         """Генерировать уникальный реферальный код."""
-        import string
-        import random
-
         while True:
             # Генерируем код из 6 символов
             code = ''.join(
@@ -1658,7 +1649,7 @@ class UserService(BaseService):
 
             # Проверяем уникальность
             async with get_unit_of_work() as uow:
-                existing = await uow.users.get_by_referral_code(code)
+                existing = await uow.users.get_by_field("referral_code", code)
                 if not existing:
                     return code
 
@@ -1863,7 +1854,13 @@ __all__ = [
     'PaymentService',
     'NotificationService',
     'UserService',
-    'AnalyticsService'
+    'AnalyticsService',
+    'get_tarot_service',
+    'get_astrology_service',
+    'get_payment_service',
+    'get_notification_service',
+    'get_user_service',
+    'get_analytics_service'
 ]
 
 # Singleton экземпляры сервисов

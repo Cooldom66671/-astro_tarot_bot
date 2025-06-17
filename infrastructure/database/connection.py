@@ -14,7 +14,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional, Dict, Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from sqlalchemy import event, pool, text
 from sqlalchemy.ext.asyncio import (
@@ -64,10 +64,10 @@ class DatabaseConnection:
         if not hasattr(self, '_initialized'):
             self._initialized = True
             self._connection_string = self._build_connection_string()
-            self._pool_recycle = 3600  # Переподключение каждый час
-            self._pool_pre_ping = True  # Проверка соединения перед использованием
-            self._echo = settings.database.echo_sql
-            self._health_check_interval = 60  # Проверка здоровья каждую минуту
+            self._pool_recycle = getattr(settings.database, 'pool_recycle', 3600)
+            self._pool_pre_ping = True
+            self._echo = settings.database.echo
+            self._health_check_interval = 60
             self._last_health_check = 0
             logger.info("DatabaseConnection инициализирован")
 
@@ -78,25 +78,47 @@ class DatabaseConnection:
         Returns:
             Строка подключения в формате asyncpg
         """
+        # Если уже есть полный URL, проверяем и корректируем его
+        db_url = settings.database.url
+
+        if db_url.startswith('postgresql://'):
+            # Заменяем на asyncpg драйвер
+            db_url = db_url.replace('postgresql://', 'postgresql+asyncpg://', 1)
+        elif db_url.startswith('postgres://'):
+            # Старый формат Heroku
+            db_url = db_url.replace('postgres://', 'postgresql+asyncpg://', 1)
+        elif not db_url.startswith('postgresql+asyncpg://'):
+            # Если URL не имеет правильного префикса
+            logger.warning(f"Неожиданный формат DATABASE_URL: {db_url[:20]}...")
+            # Пытаемся построить URL из компонентов
+            return self._build_from_components()
+
+        logger.debug("Строка подключения к БД построена из DATABASE_URL")
+        return db_url
+
+    def _build_from_components(self) -> str:
+        """Построение строки подключения из отдельных компонентов."""
+        # Парсим существующий URL чтобы извлечь компоненты
+        parsed = urlparse(settings.database.url)
+
+        host = parsed.hostname or 'localhost'
+        port = parsed.port or 5432
+        username = parsed.username or 'postgres'
+        password = parsed.password or 'postgres'
+        database = parsed.path.lstrip('/') if parsed.path else 'astrotarot_db'
+
         # Экранирование специальных символов в пароле
-        password = quote_plus(settings.database.password.get_secret_value())
+        if password:
+            password = quote_plus(password)
 
-        # Базовая строка подключения
-        conn_str = (
-            f"postgresql+asyncpg://{settings.database.user}:{password}"
-            f"@{settings.database.host}:{settings.database.port}"
-            f"/{settings.database.name}"
-        )
+        # Строим URL
+        conn_str = f"postgresql+asyncpg://{username}:{password}@{host}:{port}/{database}"
 
-        # Дополнительные параметры подключения
-        params = []
-        if settings.database.ssl_mode:
-            params.append(f"sslmode={settings.database.ssl_mode}")
+        # Дополнительные параметры из query string
+        if parsed.query:
+            conn_str += f"?{parsed.query}"
 
-        if params:
-            conn_str += "?" + "&".join(params)
-
-        logger.debug("Строка подключения к БД построена")
+        logger.debug("Строка подключения построена из компонентов")
         return conn_str
 
     async def connect(self) -> None:
@@ -111,10 +133,23 @@ class DatabaseConnection:
                 logger.info(f"Попытка подключения к БД {attempt + 1}/{self._connection_retries}")
 
                 # Выбор пула соединений в зависимости от окружения
-                if settings.is_testing():
+                if settings.environment == "testing":
                     pool_class = NullPool  # Без пула для тестов
                 else:
                     pool_class = AsyncAdaptedQueuePool
+
+                # Параметры подключения
+                connect_args = {
+                    "server_settings": {
+                        "application_name": settings.bot.name,
+                        "jit": "off"
+                    },
+                    "command_timeout": 60
+                }
+
+                # Добавляем timeout если поддерживается
+                pool_timeout = getattr(settings.database, 'pool_timeout', 30)
+                connect_args["timeout"] = pool_timeout
 
                 # Создание движка SQLAlchemy
                 self._engine = create_async_engine(
@@ -122,18 +157,11 @@ class DatabaseConnection:
                     echo=self._echo,
                     pool_size=settings.database.pool_size,
                     max_overflow=settings.database.max_overflow,
-                    pool_timeout=settings.database.pool_timeout,
+                    pool_timeout=pool_timeout,
                     pool_recycle=self._pool_recycle,
                     pool_pre_ping=self._pool_pre_ping,
                     poolclass=pool_class,
-                    connect_args={
-                        "server_settings": {
-                            "application_name": settings.bot.name,
-                            "jit": "off"
-                        },
-                        "command_timeout": 60,
-                        "timeout": settings.database.pool_timeout
-                    }
+                    connect_args=connect_args
                 )
 
                 # Создание фабрики сессий
@@ -173,8 +201,17 @@ class DatabaseConnection:
         @event.listens_for(self._engine.sync_engine, "connect")
         def receive_connect(dbapi_conn, connection_record):
             """Обработчик события подключения."""
-            connection_record.info['pid'] = dbapi_conn.get_backend_pid()
-            logger.debug(f"Новое подключение к БД, PID: {connection_record.info['pid']}")
+            # Получаем PID соединения безопасным способом
+            try:
+                if hasattr(dbapi_conn, 'get_backend_pid'):
+                    pid = dbapi_conn.get_backend_pid()
+                else:
+                    # Для asyncpg используем другой метод
+                    pid = 'async'
+                connection_record.info['pid'] = pid
+                logger.debug(f"Новое подключение к БД, PID: {pid}")
+            except Exception as e:
+                logger.debug(f"Не удалось получить PID: {e}")
 
         @event.listens_for(self._engine.sync_engine, "checkout")
         def receive_checkout(dbapi_conn, connection_record, connection_proxy):
@@ -216,6 +253,10 @@ class DatabaseConnection:
             self._engine = None
             self._session_factory = None
             logger.info("✅ Подключения к БД закрыты")
+
+    async def close(self) -> None:
+        """Псевдоним для disconnect() для совместимости."""
+        await self.disconnect()
 
     @asynccontextmanager
     async def get_session(self) -> AsyncGenerator[AsyncSession, None]:
@@ -286,25 +327,48 @@ class DatabaseConnection:
                 # Статистика пула соединений
                 pool_status = self._engine.pool.status() if hasattr(self._engine.pool, 'status') else "N/A"
 
+                # Получаем имя БД из URL
+                parsed_url = urlparse(self._connection_string)
+                db_name = parsed_url.path.lstrip('/').split('?')[0] or 'astrotarot_db'
+
                 # Размер БД
-                size_result = await conn.execute(
-                    text(f"SELECT pg_database_size('{settings.database.name}')")
-                )
-                db_size = await size_result.scalar()
+                try:
+                    size_result = await conn.execute(
+                        text(f"SELECT pg_database_size('{db_name}')")
+                    )
+                    db_size = await size_result.scalar()
+                except Exception:
+                    db_size = 0
 
                 # Количество активных соединений
-                connections_result = await conn.execute(
-                    text("SELECT count(*) FROM pg_stat_activity WHERE datname = :dbname"),
-                    {"dbname": settings.database.name}
-                )
-                active_connections = await connections_result.scalar()
+                try:
+                    connections_result = await conn.execute(
+                        text("SELECT count(*) FROM pg_stat_activity WHERE datname = :dbname"),
+                        {"dbname": db_name}
+                    )
+                    active_connections = await connections_result.scalar()
+                except Exception:
+                    active_connections = 0
+
+                # Версия PostgreSQL
+                try:
+                    version_result = await conn.execute(text("SELECT version()"))
+                    pg_version = await version_result.scalar()
+                    # Извлекаем только версию
+                    import re
+                    version_match = re.search(r'PostgreSQL (\d+\.\d+)', pg_version)
+                    version = version_match.group(1) if version_match else 'unknown'
+                except Exception:
+                    version = 'unknown'
 
                 return {
                     "status": "healthy",
                     "message": "Подключение активно",
+                    "version": version,
                     "details": {
-                        "pool_status": pool_status,
-                        "database_size_mb": round(db_size / 1024 / 1024, 2),
+                        "pool_status": str(pool_status),
+                        "database_name": db_name,
+                        "database_size_mb": round(db_size / 1024 / 1024, 2) if db_size else 0,
                         "active_connections": active_connections,
                         "max_connections": settings.database.pool_size
                     }
@@ -317,6 +381,22 @@ class DatabaseConnection:
                 "message": "Ошибка при проверке подключения",
                 "error": str(e)
             }
+
+    async def execute_raw(self, query: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Выполнение сырого SQL запроса.
+
+        Args:
+            query: SQL запрос
+            params: Параметры запроса
+
+        Returns:
+            Результат выполнения запроса
+        """
+        async with self.get_session() as session:
+            result = await session.execute(text(query), params or {})
+            await session.commit()
+            return result
 
     @property
     def engine(self) -> Optional[AsyncEngine]:
@@ -334,6 +414,7 @@ db_connection = DatabaseConnection()
 
 
 # Вспомогательные функции для удобства использования
+@asynccontextmanager
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """
     Получение сессии БД через глобальный менеджер.
@@ -355,3 +436,14 @@ async def shutdown_database() -> None:
     """Корректное завершение работы с БД при остановке приложения."""
     await db_connection.disconnect()
     logger.info("Работа с базой данных завершена")
+
+
+# Экспорт компонентов
+__all__ = [
+    'Base',
+    'DatabaseConnection',
+    'db_connection',
+    'get_db_session',
+    'init_database',
+    'shutdown_database'
+]

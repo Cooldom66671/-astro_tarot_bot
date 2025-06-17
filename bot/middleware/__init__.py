@@ -1,13 +1,12 @@
 """
-Middleware компоненты для обработки запросов.
+Middleware для обработки сообщений и событий бота.
 
-Этот модуль содержит промежуточные обработчики для:
-- Логирования всех запросов
-- Проверки подписки и прав доступа
-- Ограничения частоты запросов
-- Управления подключением к БД
-- Сбора метрик и статистики
-- Обработки ошибок
+Этот модуль содержит:
+- Базовые middleware для логирования и обработки ошибок
+- Проверку прав доступа и подписок
+- Ограничение частоты запросов (throttling)
+- Сбор метрик и статистики
+- Интернационализацию
 
 Автор: AI Assistant
 Дата создания: 2024-12-30
@@ -15,65 +14,79 @@ Middleware компоненты для обработки запросов.
 
 import logging
 import time
+from typing import Callable, Dict, Any, Optional, Awaitable, TypeVar, cast
 from datetime import datetime, timedelta
-from typing import Callable, Dict, Any, Awaitable, Optional, Union
+from collections import defaultdict
 
 from aiogram import BaseMiddleware
-from aiogram.types import Message, CallbackQuery, TelegramObject, User, Update
-from aiogram.fsm.context import FSMContext
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineQuery,
+    TelegramObject,
+    User,
+    Update
+)
 from aiogram.dispatcher.event.handler import HandlerObject
+from aiogram.exceptions import TelegramBadRequest
 
 from infrastructure import get_unit_of_work
 from config import settings
+from infrastructure.telegram import Keyboards
 
 logger = logging.getLogger(__name__)
 
+# Type alias для обработчика
+T = TypeVar('T')
+Handler = Callable[[T, Dict[str, Any]], Awaitable[Any]]
+
 
 class LoggingMiddleware(BaseMiddleware):
-    """Middleware для логирования всех запросов."""
+    """Middleware для логирования всех событий."""
 
     async def __call__(
             self,
-            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            handler: Handler[TelegramObject],
             event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
-        """Логирование входящих запросов."""
+        """Логирование входящих событий и времени обработки."""
         start_time = time.time()
 
         # Определяем тип события
-        if isinstance(event, Message):
-            event_type = "message"
+        event_type = event.__class__.__name__.lower()
+
+        # Получаем информацию о пользователе
+        user: Optional[User] = None
+        if isinstance(event, Update):
+            # Извлекаем пользователя из Update
+            if event.message:
+                user = event.message.from_user
+            elif event.callback_query:
+                user = event.callback_query.from_user
+            elif event.inline_query:
+                user = event.inline_query.from_user
+        elif hasattr(event, 'from_user'):
             user = event.from_user
-            content = event.text or event.content_type
-            chat_id = event.chat.id
-        elif isinstance(event, CallbackQuery):
-            event_type = "callback"
-            user = event.from_user
-            content = event.data
-            chat_id = event.message.chat.id if event.message else None
-        else:
-            event_type = type(event).__name__
-            user = getattr(event, 'from_user', None)
-            content = str(event)[:50]
-            chat_id = None
 
         # Логируем начало обработки
+        user_info = f"User {user.id} (@{user.username})" if user else "Unknown user"
+
+        # Детали события
+        event_details = self._get_event_details(event)
+
         logger.info(
-            f"[{event_type.upper()}] "
-            f"User: {user.username if user else 'Unknown'} ({user.id if user else 'N/A'}) "
-            f"Content: {content}"
+            f"[{event_type.upper()}] {user_info}: {event_details}"
         )
 
         try:
-            # Вызываем следующий обработчик
+            # Вызываем обработчик
             result = await handler(event, data)
 
             # Логируем успешное выполнение
             execution_time = time.time() - start_time
             logger.info(
-                f"[{event_type.upper()}] Success. "
+                f"[{event_type.upper()}] Processed successfully. "
                 f"Time: {execution_time:.3f}s"
             )
 
@@ -89,13 +102,38 @@ class LoggingMiddleware(BaseMiddleware):
             )
             raise
 
+    def _get_event_details(self, event: TelegramObject) -> str:
+        """Получить детали события для логирования."""
+        if isinstance(event, Message):
+            if event.text:
+                return f"Text: {event.text[:50]}..."
+            elif event.photo:
+                return "Photo message"
+            elif event.document:
+                return "Document message"
+            else:
+                return "Other message"
+        elif isinstance(event, CallbackQuery):
+            return f"Callback: {event.data}"
+        elif isinstance(event, InlineQuery):
+            return f"Inline: {event.query}"
+        elif isinstance(event, Update):
+            # Для Update рекурсивно получаем детали вложенного события
+            if event.message:
+                return self._get_event_details(event.message)
+            elif event.callback_query:
+                return self._get_event_details(event.callback_query)
+            elif event.inline_query:
+                return self._get_event_details(event.inline_query)
+        return "Unknown event"
+
 
 class DatabaseMiddleware(BaseMiddleware):
     """Middleware для управления подключением к БД."""
 
     async def __call__(
             self,
-            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            handler: Handler[TelegramObject],
             event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
@@ -104,18 +142,31 @@ class DatabaseMiddleware(BaseMiddleware):
         async with get_unit_of_work() as uow:
             data['uow'] = uow
 
-            # Если есть пользователь, загружаем его данные
-            user = getattr(event, 'from_user', None)
+            # Извлекаем пользователя из события
+            user = self._extract_user(event)
             if user:
                 db_user = await uow.users.get_by_telegram_id(user.id)
                 if db_user:
                     data['db_user'] = db_user
                     # Обновляем последнюю активность
                     db_user.last_active_at = datetime.utcnow()
-                    await uow.users.update(db_user)
+                    await uow.users.update(db_user.id, last_active_at=db_user.last_active_at)
                     await uow.commit()
 
             return await handler(event, data)
+
+    def _extract_user(self, event: TelegramObject) -> Optional[User]:
+        """Извлечь пользователя из события."""
+        if isinstance(event, Update):
+            if event.message:
+                return event.message.from_user
+            elif event.callback_query:
+                return event.callback_query.from_user
+            elif event.inline_query:
+                return event.inline_query.from_user
+        elif hasattr(event, 'from_user'):
+            return event.from_user
+        return None
 
 
 class ThrottlingMiddleware(BaseMiddleware):
@@ -138,25 +189,28 @@ class ThrottlingMiddleware(BaseMiddleware):
 
     async def __call__(
             self,
-            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            handler: Handler[TelegramObject],
             event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
         """Проверка лимитов частоты запросов."""
-        user = getattr(event, 'from_user', None)
+        # Получаем пользователя
+        user = self._extract_user(event)
         if not user:
             return await handler(event, data)
 
         user_id = user.id
+
+        # Проверяем премиум пользователей (удвоенные лимиты)
+        is_premium = data.get('subscription_level', 'free') != 'free'
+
+        # Определяем тип действия
+        action_type = self._get_action_type(event)
+        limit, window = self._get_rate_limit(action_type, is_premium)
+
+        # Проверяем лимит
         current_time = time.time()
 
-        # Определяем тип действия для лимитов
-        action_type = self._get_action_type(event)
-
-        # Получаем лимиты для действия
-        limit, window = self._get_rate_limit(action_type)
-
-        # Инициализируем данные пользователя
         if user_id not in self.user_timestamps:
             self.user_timestamps[user_id] = {}
 
@@ -164,74 +218,96 @@ class ThrottlingMiddleware(BaseMiddleware):
             self.user_timestamps[user_id][action_type] = []
 
         # Очищаем старые временные метки
-        timestamps = self.user_timestamps[user_id][action_type]
-        timestamps[:] = [
-            ts for ts in timestamps
+        self.user_timestamps[user_id][action_type] = [
+            ts for ts in self.user_timestamps[user_id][action_type]
             if current_time - ts < window
         ]
 
-        # Проверяем лимит
-        if len(timestamps) >= limit:
-            # Вычисляем время до следующей попытки
-            oldest_timestamp = timestamps[0]
-            retry_after = int(window - (current_time - oldest_timestamp))
+        # Проверяем превышение лимита
+        if len(self.user_timestamps[user_id][action_type]) >= limit:
+            # Считаем время до следующей возможности
+            oldest_timestamp = min(self.user_timestamps[user_id][action_type])
+            wait_time = int(window - (current_time - oldest_timestamp))
+
+            # Отвечаем об ограничении
+            message = (
+                f"⚠️ Слишком много запросов!\n"
+                f"Подождите {wait_time} секунд перед следующим действием."
+            )
+
+            if isinstance(event, Message):
+                await event.answer(message)
+            elif isinstance(event, CallbackQuery):
+                await event.answer(message, show_alert=True)
 
             logger.warning(
                 f"Rate limit exceeded for user {user_id} "
-                f"({user.username}). Action: {action_type}"
+                f"({action_type}: {len(self.user_timestamps[user_id][action_type])}/{limit})"
             )
 
-            # Отвечаем пользователю
-            if isinstance(event, CallbackQuery):
-                await event.answer(
-                    f"Слишком много запросов! "
-                    f"Попробуйте через {retry_after} сек.",
-                    show_alert=True
-                )
-            elif isinstance(event, Message):
-                await event.answer(
-                    f"⚠️ Слишком много запросов!\n"
-                    f"Подождите {retry_after} секунд перед следующей попыткой."
-                )
-
-            # Не передаем дальше
             return None
 
-        # Добавляем текущую временную метку
-        timestamps.append(current_time)
+        # Добавляем временную метку
+        self.user_timestamps[user_id][action_type].append(current_time)
 
         return await handler(event, data)
 
-    def _get_action_type(self, event: TelegramObject) -> str:
-        """Определить тип действия для применения лимитов."""
-        if isinstance(event, Message):
-            if event.text and event.text.startswith('/'):
-                command = event.text.split()[0][1:]
-                if command in ['tarot', 'astrology']:
-                    return 'feature_command'
-                elif command in ['start', 'help', 'menu']:
-                    return 'basic_command'
-                else:
-                    return 'other_command'
-            else:
-                return 'message'
+    def _extract_user(self, event: TelegramObject) -> Optional[User]:
+        """Извлечь пользователя из события."""
+        if isinstance(event, (Message, CallbackQuery, InlineQuery)):
+            return event.from_user
+        elif isinstance(event, Update):
+            if event.message:
+                return event.message.from_user
+            elif event.callback_query:
+                return event.callback_query.from_user
+            elif event.inline_query:
+                return event.inline_query.from_user
+        return None
 
-        elif isinstance(event, CallbackQuery):
-            if event.data:
-                if event.data.startswith(('tarot_', 'spread_')):
-                    return 'tarot_action'
-                elif event.data.startswith(('horoscope_', 'natal_')):
-                    return 'astrology_action'
-                elif event.data.startswith('payment_'):
-                    return 'payment_action'
-                else:
-                    return 'callback'
+    def _get_action_type(self, event: TelegramObject) -> str:
+        """Определить тип действия для лимитов."""
+        if isinstance(event, Message) and event.text:
+            command = event.text.split()[0]
+
+            # Команды с особыми лимитами
+            feature_commands = ['/tarot', '/horoscope', '/natal', '/compatibility']
+            if command in feature_commands:
+                return 'feature_command'
+
+            # Платежные команды
+            payment_commands = ['/pay', '/subscription', '/premium']
+            if command in payment_commands:
+                return 'payment_action'
+
+            # Обычные команды
+            if command.startswith('/'):
+                return 'basic_command'
+
+            return 'message'
+
+        elif isinstance(event, CallbackQuery) and event.data:
+            # Callback actions
+            if event.data.startswith('tarot:'):
+                return 'tarot_action'
+            elif event.data.startswith('astrology:'):
+                return 'astrology_action'
+            elif event.data.startswith(('pay:', 'subscription:')):
+                return 'payment_action'
+
+            return 'callback'
 
         return 'other'
 
-    def _get_rate_limit(self, action_type: str) -> tuple[int, int]:
+    def _get_rate_limit(self, action_type: str, is_premium: bool) -> tuple:
         """Получить лимиты для типа действия."""
-        return self.RATE_LIMITS.get(action_type, (15, 60))
+        limit, window = self.RATE_LIMITS.get(action_type, (15, 60))
+
+        # Удваиваем лимиты для премиум пользователей
+        if is_premium:
+            limit *= 2
+
+        return limit, window
 
 
 class SubscriptionMiddleware(BaseMiddleware):
@@ -239,12 +315,12 @@ class SubscriptionMiddleware(BaseMiddleware):
 
     async def __call__(
             self,
-            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            handler: Handler[TelegramObject],
             event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
         """Проверка активной подписки и добавление в контекст."""
-        user = getattr(event, 'from_user', None)
+        user = self._extract_user(event)
         if not user:
             return await handler(event, data)
 
@@ -263,11 +339,12 @@ class SubscriptionMiddleware(BaseMiddleware):
             data['subscription_level'] = db_user.subscription_plan if hasattr(db_user, 'subscription_plan') else 'free'
 
             # Проверяем, не истекла ли подписка
-            if subscription and hasattr(subscription, 'expires_at') and subscription.expires_at < datetime.utcnow():
+            if subscription and hasattr(subscription, 'end_date') and subscription.end_date < datetime.utcnow():
                 # Деактивируем подписку
                 subscription.is_active = False
                 db_user.subscription_plan = 'free'
-                await uow.users.update(db_user)
+                await uow.users.update(db_user.id, subscription_plan='free')
+                await uow.subscriptions.update(subscription.id, is_active=False)
                 await uow.commit()
 
                 # Уведомляем пользователя
@@ -280,6 +357,19 @@ class SubscriptionMiddleware(BaseMiddleware):
 
         return await handler(event, data)
 
+    def _extract_user(self, event: TelegramObject) -> Optional[User]:
+        """Извлечь пользователя из события."""
+        if isinstance(event, (Message, CallbackQuery, InlineQuery)):
+            return event.from_user
+        elif isinstance(event, Update):
+            if event.message:
+                return event.message.from_user
+            elif event.callback_query:
+                return event.callback_query.from_user
+            elif event.inline_query:
+                return event.inline_query.from_user
+        return None
+
 
 class MetricsMiddleware(BaseMiddleware):
     """Middleware для сбора метрик."""
@@ -289,16 +379,16 @@ class MetricsMiddleware(BaseMiddleware):
             'total_requests': 0,
             'successful_requests': 0,
             'failed_requests': 0,
-            'commands': {},
-            'callbacks': {},
+            'commands': defaultdict(int),
+            'callbacks': defaultdict(int),
             'response_times': [],
             'users': set(),
-            'errors': {}
+            'errors': defaultdict(int)
         }
 
     async def __call__(
             self,
-            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            handler: Handler[TelegramObject],
             event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
@@ -306,46 +396,58 @@ class MetricsMiddleware(BaseMiddleware):
         start_time = time.time()
         self.metrics['total_requests'] += 1
 
-        # Записываем пользователя
-        user = getattr(event, 'from_user', None)
+        # Получаем пользователя
+        user = self._extract_user(event)
         if user:
             self.metrics['users'].add(user.id)
 
-        # Записываем тип запроса
-        if isinstance(event, Message) and event.text:
-            if event.text.startswith('/'):
-                command = event.text.split()[0]
-                self.metrics['commands'][command] = \
-                    self.metrics['commands'].get(command, 0) + 1
+        # Определяем тип события
+        if isinstance(event, Message) and event.text and event.text.startswith('/'):
+            command = event.text.split()[0]
+            self.metrics['commands'][command] += 1
         elif isinstance(event, CallbackQuery) and event.data:
             callback_prefix = event.data.split(':')[0]
-            self.metrics['callbacks'][callback_prefix] = \
-                self.metrics['callbacks'].get(callback_prefix, 0) + 1
+            self.metrics['callbacks'][callback_prefix] += 1
 
         try:
+            # Вызываем обработчик
             result = await handler(event, data)
+
+            # Записываем успех
             self.metrics['successful_requests'] += 1
 
-            # Записываем время ответа
-            response_time = time.time() - start_time
-            self.metrics['response_times'].append(response_time)
+            # Записываем время выполнения
+            execution_time = time.time() - start_time
+            self.metrics['response_times'].append(execution_time)
 
-            # Ограничиваем размер списка
+            # Ограничиваем размер списка времен
             if len(self.metrics['response_times']) > 1000:
-                self.metrics['response_times'] = \
-                    self.metrics['response_times'][-1000:]
+                self.metrics['response_times'] = self.metrics['response_times'][-1000:]
 
             return result
 
         except Exception as e:
+            # Записываем ошибку
             self.metrics['failed_requests'] += 1
             error_type = type(e).__name__
-            self.metrics['errors'][error_type] = \
-                self.metrics['errors'].get(error_type, 0) + 1
+            self.metrics['errors'][error_type] += 1
             raise
 
+    def _extract_user(self, event: TelegramObject) -> Optional[User]:
+        """Извлечь пользователя из события."""
+        if isinstance(event, (Message, CallbackQuery, InlineQuery)):
+            return event.from_user
+        elif isinstance(event, Update):
+            if event.message:
+                return event.message.from_user
+            elif event.callback_query:
+                return event.callback_query.from_user
+            elif event.inline_query:
+                return event.inline_query.from_user
+        return None
+
     def get_metrics(self) -> Dict[str, Any]:
-        """Получить собранные метрики."""
+        """Получить текущие метрики."""
         avg_response_time = (
             sum(self.metrics['response_times']) /
             len(self.metrics['response_times'])
@@ -386,11 +488,11 @@ class MetricsMiddleware(BaseMiddleware):
             'total_requests': 0,
             'successful_requests': 0,
             'failed_requests': 0,
-            'commands': {},
-            'callbacks': {},
+            'commands': defaultdict(int),
+            'callbacks': defaultdict(int),
             'response_times': [],
             'users': set(),
-            'errors': {}
+            'errors': defaultdict(int)
         }
 
 
@@ -399,7 +501,7 @@ class AdminCheckMiddleware(BaseMiddleware):
 
     async def __call__(
             self,
-            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            handler: Handler[TelegramObject],
             event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
@@ -431,27 +533,76 @@ class AdminCheckMiddleware(BaseMiddleware):
 class I18nMiddleware(BaseMiddleware):
     """Middleware для интернационализации."""
 
+    def __init__(self):
+        self.translations = {
+            'ru': {},  # Русский по умолчанию
+            'en': {
+                'welcome': 'Welcome!',
+                'menu': 'Menu',
+                'back': 'Back',
+                'cancel': 'Cancel',
+                'error': 'Error occurred',
+                'success': 'Success!',
+                'loading': 'Loading...',
+                'premium_required': 'Premium subscription required',
+                'rate_limit': 'Too many requests. Please wait.'
+            }
+        }
+
     async def __call__(
             self,
-            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            handler: Handler[TelegramObject],
             event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
-        """Установка языка пользователя."""
-        db_user = data.get('db_user')
+        """Добавление функций перевода в контекст."""
+        # Получаем язык пользователя
+        user = self._extract_user(event)
+        language_code = 'ru'  # По умолчанию русский
 
-        if db_user:
-            # Устанавливаем язык из настроек пользователя
-            data['locale'] = getattr(db_user, 'language_code', 'ru')
-        else:
-            # Используем язык из Telegram
-            user = getattr(event, 'from_user', None)
-            if user:
-                data['locale'] = user.language_code or 'ru'
-            else:
-                data['locale'] = 'ru'
+        if user:
+            # Из настроек пользователя
+            db_user = data.get('db_user')
+            if db_user and hasattr(db_user, 'language'):
+                language_code = db_user.language
+            # Или из языка Telegram
+            elif hasattr(user, 'language_code') and user.language_code:
+                # Берем только первые 2 символа (en_US -> en)
+                language_code = user.language_code[:2]
+
+        # Функция перевода
+        def _(key: str, **kwargs) -> str:
+            """Получить перевод по ключу."""
+            translations = self.translations.get(language_code, {})
+            text = translations.get(key, key)
+
+            # Подставляем параметры
+            if kwargs:
+                try:
+                    text = text.format(**kwargs)
+                except KeyError:
+                    pass
+
+            return text
+
+        # Добавляем в контекст
+        data['_'] = _
+        data['language_code'] = language_code
 
         return await handler(event, data)
+
+    def _extract_user(self, event: TelegramObject) -> Optional[User]:
+        """Извлечь пользователя из события."""
+        if isinstance(event, (Message, CallbackQuery, InlineQuery)):
+            return event.from_user
+        elif isinstance(event, Update):
+            if event.message:
+                return event.message.from_user
+            elif event.callback_query:
+                return event.callback_query.from_user
+            elif event.inline_query:
+                return event.inline_query.from_user
+        return None
 
 
 class ErrorHandlingMiddleware(BaseMiddleware):
@@ -459,104 +610,138 @@ class ErrorHandlingMiddleware(BaseMiddleware):
 
     async def __call__(
             self,
-            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            handler: Handler[TelegramObject],
             event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
-        """Обработка необработанных ошибок."""
+        """Обработка ошибок с уведомлением пользователя."""
         try:
             return await handler(event, data)
 
-        except TelegramRetryAfter as e:
-            # Обработка превышения лимитов Telegram
-            logger.warning(f"Telegram rate limit: retry after {e.retry_after}s")
+        except TelegramBadRequest as e:
+            # Ошибки Telegram API
+            logger.error(f"Telegram API error: {e}")
 
-            if isinstance(event, Message):
-                await event.answer(
-                    f"⏳ Telegram временно ограничил отправку сообщений.\n"
-                    f"Попробуйте через {e.retry_after} секунд."
-                )
+            error_messages = {
+                "message is not modified": "Сообщение не изменилось",
+                "message to delete not found": "Сообщение уже удалено",
+                "message can't be deleted": "Невозможно удалить сообщение",
+                "query is too old": "Запрос устарел",
+                "bot was blocked by the user": "Бот заблокирован пользователем"
+            }
+
+            # Ищем подходящее сообщение
+            user_message = "Произошла ошибка при обработке запроса"
+            for error_key, message in error_messages.items():
+                if error_key in str(e).lower():
+                    user_message = message
+                    break
+
+            # Уведомляем пользователя
+            if isinstance(event, CallbackQuery):
+                await event.answer(f"❌ {user_message}", show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer(f"❌ {user_message}")
 
         except Exception as e:
-            # Логируем ошибку
-            logger.error(
-                f"Unhandled error in middleware: {type(e).__name__}: {str(e)}",
-                exc_info=True
+            # Другие ошибки
+            logger.error(f"Unhandled error: {type(e).__name__}: {e}", exc_info=True)
+
+            # Уведомляем пользователя
+            error_message = (
+                "❌ Произошла непредвиденная ошибка.\n"
+                "Попробуйте повторить действие позже.\n\n"
+                "Если ошибка повторяется, обратитесь в поддержку: /help"
             )
 
-            # Пытаемся уведомить пользователя
             try:
-                error_message = (
-                    "❌ <b>Произошла ошибка</b>\n\n"
-                    "К сожалению, что-то пошло не так. "
-                    "Попробуйте повторить позже или обратитесь в поддержку.\n\n"
-                    "Используйте /start для перезапуска."
-                )
-
-                if isinstance(event, Message):
-                    await event.answer(error_message, parse_mode="HTML")
-                elif isinstance(event, CallbackQuery):
-                    await event.answer(
-                        "Произошла ошибка. Попробуйте позже.",
-                        show_alert=True
-                    )
+                if isinstance(event, CallbackQuery):
+                    await event.answer("❌ Произошла ошибка", show_alert=True)
+                    if event.message:
+                        await event.message.answer(error_message)
+                elif isinstance(event, Message):
+                    await event.answer(error_message)
             except:
-                # Если не можем отправить сообщение об ошибке, просто логируем
-                logger.error("Failed to send error message to user")
+                # Если не удалось отправить сообщение об ошибке
+                pass
+
+            # Уведомляем админов о критических ошибках
+            if settings.bot.developer_id and hasattr(data, 'bot'):
+                try:
+                    bot = data['bot']
+                    error_report = (
+                        f"🚨 <b>Критическая ошибка</b>\n\n"
+                        f"<b>Тип:</b> <code>{type(e).__name__}</code>\n"
+                        f"<b>Сообщение:</b> <code>{str(e)}</code>\n"
+                        f"<b>Пользователь:</b> {self._get_user_info(event)}\n"
+                        f"<b>Время:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    await bot.send_message(
+                        settings.bot.developer_id,
+                        error_report,
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+
+    def _get_user_info(self, event: TelegramObject) -> str:
+        """Получить информацию о пользователе для отчета."""
+        user = None
+        if isinstance(event, (Message, CallbackQuery, InlineQuery)):
+            user = event.from_user
+        elif isinstance(event, Update):
+            if event.message:
+                user = event.message.from_user
+            elif event.callback_query:
+                user = event.callback_query.from_user
+
+        if user:
+            return f"{user.id} (@{user.username})"
+        return "Unknown"
 
 
 class StateTimeoutMiddleware(BaseMiddleware):
-    """Middleware для контроля таймаутов состояний FSM."""
+    """Middleware для автоматического сброса состояний по таймауту."""
 
-    # Таймауты для различных состояний (в секундах)
-    STATE_TIMEOUTS = {
-        'default': 600,  # 10 минут по умолчанию
-        'waiting_for_payment': 1800,  # 30 минут для оплаты
-        'waiting_for_text': 300,  # 5 минут для ввода текста
-        'selecting_cards': 900,  # 15 минут для выбора карт
-    }
-
-    def __init__(self):
+    def __init__(self, timeout_minutes: int = 30):
+        self.timeout = timedelta(minutes=timeout_minutes)
         self.state_timestamps: Dict[int, datetime] = {}
 
     async def __call__(
             self,
-            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            handler: Handler[TelegramObject],
             event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
-        """Проверка таймаутов состояний."""
-        user = getattr(event, 'from_user', None)
+        """Проверка и сброс устаревших состояний."""
+        # Получаем пользователя
+        user = self._extract_user(event)
         if not user:
             return await handler(event, data)
 
         user_id = user.id
-        state: FSMContext = data.get('state')
+        current_time = datetime.utcnow()
 
-        if state:
-            current_state = await state.get_state()
+        # Проверяем состояние
+        fsm_context = data.get('state')
+        if fsm_context:
+            current_state = await fsm_context.get_state()
 
             if current_state:
                 # Проверяем таймаут
                 if user_id in self.state_timestamps:
-                    time_in_state = datetime.utcnow() - self.state_timestamps[user_id]
-
-                    # Получаем таймаут для текущего состояния
-                    timeout = self.STATE_TIMEOUTS.get('default', 600)
-                    for state_key in self.STATE_TIMEOUTS:
-                        if state_key in current_state:
-                            timeout = self.STATE_TIMEOUTS[state_key]
-                            break
-
-                    if time_in_state.total_seconds() > timeout:
-                        # Очищаем состояние
-                        await state.clear()
+                    last_activity = self.state_timestamps[user_id]
+                    if current_time - last_activity > self.timeout:
+                        # Сбрасываем состояние
+                        await fsm_context.clear()
 
                         # Уведомляем пользователя
                         if isinstance(event, Message):
+                            keyboard = await Keyboards.main_menu()
                             await event.answer(
-                                "⏰ Время ожидания истекло.\n"
-                                "Используйте /menu для возврата в главное меню."
+                                "⏰ Время сессии истекло.\n"
+                                "Пожалуйста, начните заново.",
+                                reply_markup=keyboard
                             )
 
                         # Удаляем временную метку
@@ -565,13 +750,26 @@ class StateTimeoutMiddleware(BaseMiddleware):
                         return None
 
                 # Обновляем временную метку
-                self.state_timestamps[user_id] = datetime.utcnow()
+                self.state_timestamps[user_id] = current_time
             else:
                 # Удаляем временную метку если состояния нет
                 if user_id in self.state_timestamps:
                     del self.state_timestamps[user_id]
 
         return await handler(event, data)
+
+    def _extract_user(self, event: TelegramObject) -> Optional[User]:
+        """Извлечь пользователя из события."""
+        if isinstance(event, (Message, CallbackQuery, InlineQuery)):
+            return event.from_user
+        elif isinstance(event, Update):
+            if event.message:
+                return event.message.from_user
+            elif event.callback_query:
+                return event.callback_query.from_user
+            elif event.inline_query:
+                return event.inline_query.from_user
+        return None
 
 
 # Экспорт всех middleware
@@ -603,29 +801,29 @@ def setup_middleware(dp):
     state_timeout_middleware = StateTimeoutMiddleware()
 
     # Регистрируем в правильном порядке для aiogram 3.x
-    # Для глобальных middleware используем update.middleware
+    # Для глобальных middleware используем update.outer_middleware
 
     # Сначала обработка ошибок и логирование (для всех типов событий)
-    dp.update.middleware(error_middleware)
-    dp.update.middleware(logging_middleware)
-    dp.update.middleware(metrics_middleware)
+    dp.update.outer_middleware(error_middleware)
+    dp.update.outer_middleware(logging_middleware)
+    dp.update.outer_middleware(metrics_middleware)
+
+    # База данных и пользователь
+    dp.update.outer_middleware(database_middleware)
+
+    # Подписка и права
+    dp.update.outer_middleware(subscription_middleware)
+
+    # Языки для всех типов
+    dp.update.outer_middleware(i18n_middleware)
 
     # Затем специфичные middleware для message и callback_query
     # Проверка частоты запросов
     dp.message.middleware(throttling_middleware)
     dp.callback_query.middleware(throttling_middleware)
 
-    # База данных и пользователь
-    dp.update.middleware(database_middleware)
-
-    # Подписка и права
-    dp.update.middleware(subscription_middleware)
-
     # Проверка админских прав только для сообщений
     dp.message.middleware(admin_middleware)
-
-    # Языки для всех типов
-    dp.update.middleware(i18n_middleware)
 
     # Таймауты состояний
     dp.message.middleware(state_timeout_middleware)
